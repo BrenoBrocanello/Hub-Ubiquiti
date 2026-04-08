@@ -1,0 +1,6 @@
+config_contas.json
+config_provedores.json
+__pycache__/
+*.xlsx
+*.csv
+.env

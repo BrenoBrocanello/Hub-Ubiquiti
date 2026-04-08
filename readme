@@ -1,0 +1,103 @@
+# Hub Redes — EACE
+
+Monitor de conectividade de escolas brasileiras integrando **Ubiquiti**, **Omada** e **Zyxel Nebula**.
+
+## Funcionalidades
+
+- Consulta status de escolas via API Ubiquiti (em tempo real)
+- Cruzamento com export do Omada Cloud (On Premise Systems)
+- Cruzamento com export do Zyxel Nebula (Overview → Sites)
+- Identificação da plataforma por chamado: `UBIQUITI`, `OMADA`, `ZYXEL`
+- Cadastro de provedores (ISP) com telefone, celular e observações
+- Filtros por status, plataforma, ISP, UF, analista e conta
+- Exportação dos resultados em `.xlsx`
+
+## Instalação
+
+### 1. Clone o repositório
+
+```bash
+git clone https://github.com/seu-usuario/eace-hub.git
+cd eace-hub
+```
+
+### 2. Crie um ambiente virtual (recomendado)
+
+```bash
+python -m venv venv
+# Windows:
+venv\Scripts\activate
+# Linux/Mac:
+source venv/bin/activate
+```
+
+### 3. Instale as dependências
+
+```bash
+pip install -r requirements.txt
+```
+
+### 4. Configure as contas
+
+Copie o arquivo de exemplo e preencha com suas chaves API Ubiquiti:
+
+```bash
+cp config_contas.example.json config_contas.json
+```
+
+Edite `config_contas.json` substituindo `COLE_SUA_CHAVE_AQUI` pela chave real de cada conta.
+
+> As chaves API Ubiquiti são obtidas no painel **Network → Settings → API Keys**.
+
+Opcionalmente, configure os provedores:
+
+```bash
+cp config_provedores.example.json config_provedores.json
+```
+
+### 5. Execute o app
+
+```bash
+streamlit run hub_ubiquiti.py
+```
+
+O app abrirá automaticamente em `http://localhost:8501`.
+
+## Uso
+
+### Ubiquiti (API em tempo real)
+As chaves ficam salvas em `config_contas.json` (ignorado pelo git).
+Configure na barra lateral do app e clique em **Salvar**.
+
+### Omada (export manual)
+1. Acesse `use1-omada-cloud.tplinkcloud.com`
+2. Vá em **On Premise Systems**
+3. Clique no botão **Export** (canto superior direito)
+4. Faça upload do `.xlsx` gerado na aba **Processar Planilha**
+
+### Zyxel Nebula (export manual)
+1. Acesse o portal Zyxel Nebula
+2. Vá em **Overview → Sites**
+3. Clique no ícone de download para exportar o CSV
+4. Faça upload do `.csv` gerado na aba **Processar Planilha**
+
+## Arquivos ignorados pelo git
+
+| Arquivo | Motivo |
+|---|---|
+| `config_contas.json` | Contém chaves API |
+| `config_provedores.json` | Contém dados de contato internos |
+| `*.xlsx` | Planilhas com dados de chamados |
+| `*.csv` | Exports com dados de infraestrutura |
+
+## Estrutura do projeto
+
+```
+eace-hub/
+├── hub_ubiquiti.py              # App principal
+├── requirements.txt             # Dependências Python
+├── .gitignore                   # Arquivos ignorados pelo git
+├── config_contas.example.json   # Modelo de configuração de contas
+├── config_provedores.example.json # Modelo de cadastro de provedores
+└── README.md
+```
