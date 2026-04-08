@@ -17,7 +17,7 @@ Monitor de conectividade de escolas brasileiras integrando **Ubiquiti**, **Omada
 ### 1. Clone o repositório
 
 ```bash
-git clone https://github.com/seu-usuario/eace-hub.git
+git clone https://github.com/BrenoBrocanello/hubiquiti
 cd eace-hub
 ```
 
