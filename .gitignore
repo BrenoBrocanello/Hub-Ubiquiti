@@ -1,4 +1,4 @@
-config_contas.json
+Secrets.toml
 config_provedores.json
 __pycache__/
 *.xlsx

@@ -166,13 +166,30 @@ def salvar_contas(contas):
         pass
 
 def carregar_contas():
+    """
+    Lê as contas exclusivamente dos Streamlit Secrets.
+    Formato esperado em secrets.toml:
+        [contas]
+        Conta_AC1  = "chave1"
+        Conta_AM1  = "chave2"
+    """
+    try:
+        contas_secrets = st.secrets.get("contas", {})
+        if contas_secrets:
+            return [
+                {"apelido": apelido, "api_key": api_key}
+                for apelido, api_key in contas_secrets.items()
+            ]
+    except Exception:
+        pass
+    # Fallback local para desenvolvimento (arquivo ignorado pelo git)
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             pass
-    return [{"apelido": "Conta AC", "api_key": ""}]
+    return []
 
 def salvar_provedores(provs: dict) -> bool:
     try:
@@ -503,6 +520,61 @@ def to_xlsx(df: pd.DataFrame) -> bytes:
         df.to_excel(w, index=False, sheet_name="Resultado")
     return buf.getvalue()
 
+def deduplicar_por_inep(todos: dict) -> dict:
+    """
+    Recebe dict {inep: dados} já montado e garante que cada INEP
+    fique com a entrada de maior qualidade.
+    Prioridade: ONLINE > tem ISP > tem IP > tem Uptime.
+    INEPs '—' são ignorados (não há como deduplicar sem chave).
+    """
+    def _score(dados):
+        s = 0
+        if "ONLINE" in str(dados.get("Status Rede", "")): s += 100
+        if str(dados.get("ISP",        "—")) not in ("—", "", "nan"): s += 10
+        if str(dados.get("IP Externo", "—")) not in ("—", "", "nan"): s += 5
+        if str(dados.get("Uptime WAN", "—")) not in ("—", "", "nan"): s += 1
+        return s
+
+    # Agrupa candidatos por INEP
+    candidatos: dict[str, list] = {}
+    for inep, dados in todos.items():
+        candidatos.setdefault(inep, []).append(dados)
+
+    resultado = {}
+    for inep, lista in candidatos.items():
+        melhor = max(lista, key=_score)
+        resultado[inep] = melhor
+    return resultado
+
+
+def deduplicar_df_por_inep(df: pd.DataFrame) -> tuple:
+    """
+    Versão DataFrame para o Inventário Geral.
+    Retorna (df_deduplicado, n_removidos).
+    """
+    def _score_row(row):
+        s = 0
+        if "ONLINE" in str(row.get("Status Rede", "")): s += 100
+        if str(row.get("ISP",        "—")) not in ("—", "", "nan"): s += 10
+        if str(row.get("IP Externo", "—")) not in ("—", "", "nan"): s += 5
+        if str(row.get("Uptime WAN", "—")) not in ("—", "", "nan"): s += 1
+        return s
+
+    sem_inep = df[df["INEP"] == "—"].copy()
+    com_inep = df[df["INEP"] != "—"].copy()
+    if not com_inep.empty:
+        com_inep["_score"] = com_inep.apply(_score_row, axis=1)
+        com_inep = (
+            com_inep
+            .sort_values("_score", ascending=False)
+            .drop_duplicates(subset=["INEP"], keep="first")
+            .drop(columns=["_score"])
+        )
+    antes     = len(df)
+    df_result = pd.concat([com_inep, sem_inep], ignore_index=True)
+    return df_result, antes - len(df_result)
+
+
 def mesclar_isps_novos(isps_novos: set) -> int:
     provs = dict(st.session_state.provedores)
     novos = 0
@@ -520,53 +592,25 @@ def mesclar_isps_novos(isps_novos: set) -> int:
 # SIDEBAR
 # ═══════════════════════════════════════════════════════════════
 with st.sidebar:
+    # Contas carregadas dos Secrets — sem exposição de chaves na UI
+    validas = [c for c in st.session_state.contas if c.get("api_key", "").strip()]
+
     st.markdown('<div class="sidebar-label">Contas Ubiquiti</div>', unsafe_allow_html=True)
-
-    c1, c2 = st.columns(2)
-    if c1.button("＋ Nova", use_container_width=True):
-        st.session_state.contas.append({"apelido": f"Conta {len(st.session_state.contas)+1}", "api_key": ""})
-        st.rerun()
-    if c2.button("Salvar", type="primary", use_container_width=True):
-        salvar_contas(st.session_state.contas)
-        st.toast("Contas salvas!", icon="✅")
-
-    to_del = []
-    for i, c in enumerate(st.session_state.contas):
-        label = ("🔑 " if c["api_key"].strip() else "○ ") + (c["apelido"] or "Sem nome")
-        with st.expander(label, expanded=False):
-            st.session_state.contas[i]["apelido"] = st.text_input(
-                "Apelido", value=c["apelido"], key=f"ap_{i}",
-                label_visibility="collapsed", placeholder="Ex: Conta AC"
-            )
-            st.session_state.contas[i]["api_key"] = st.text_input(
-                "Chave API", value=c["api_key"], type="password", key=f"k_{i}",
-                label_visibility="collapsed", placeholder="Cole a chave API aqui..."
-            )
-            if st.button("Remover", key=f"d_{i}", use_container_width=True):
-                to_del.append(i)
-
-    if to_del:
-        for ix in sorted(to_del, reverse=True):
-            st.session_state.contas.pop(ix)
-        salvar_contas(st.session_state.contas)
-        st.rerun()
-
-    st.markdown('<div class="sidebar-label">Contas Ativas para Busca</div>', unsafe_allow_html=True)
-    validas = [c for c in st.session_state.contas if c["api_key"].strip()]
     if validas:
         sel  = st.multiselect(
-            "contas", [c["apelido"] for c in validas],
+            "Selecionar contas:",
+            [c["apelido"] for c in validas],
             default=[c["apelido"] for c in validas],
             label_visibility="collapsed"
         )
         alvo = [c for c in validas if c["apelido"] in sel]
     else:
-        st.caption("Nenhuma conta com chave configurada.")
+        st.warning("Nenhuma conta configurada nos Secrets.")
         alvo = []
 
     st.markdown('<div class="sidebar-label">Status</div>', unsafe_allow_html=True)
     ca, cb = st.columns(2)
-    ca.metric("Contas", len(validas))
+    ca.metric("Contas",  len(validas))
     cb.metric("Ativas",  len(alvo))
     if st.session_state.ultima_consulta:
         st.caption(f"Última consulta: {st.session_state.ultima_consulta}")
@@ -741,6 +785,9 @@ with t1:
                     log.append(("ok", f"Zyxel: {cruzados_zy} escola(s) cruzada(s) de {len(res_zy)} sites"))
                 except Exception as e:
                     log.append(("err", f"Zyxel export: {e}"))
+
+            # Deduplicação: mantém a melhor entrada por INEP
+            todos = deduplicar_por_inep(todos)
 
             df_f = df_raw.copy()
             df_f["INEP_K"] = df_f["INEP"].astype(str).str.replace(r'\.0$','',regex=True).str.strip()
@@ -920,6 +967,12 @@ with t3:
 
                 if todas_linhas:
                     df_inv = pd.DataFrame(todas_linhas)
+
+                    # Deduplicação centralizada
+                    df_inv, removidos = deduplicar_df_por_inep(df_inv)
+                    if removidos > 0:
+                        log_inv.append(("ok", f"Deduplicação: {removidos} duplicata(s) removida(s)"))
+
                     # Garante ordem das colunas
                     col_order = ["INEP","Nome no Console","Status Rede","Plataforma",
                                  "Uptime WAN","ISP","Conta","IP Externo"]
@@ -927,7 +980,7 @@ with t3:
                                     [c for c in df_inv.columns if c not in col_order]]
                     st.session_state.df_inventario     = df_inv
                     st.session_state.inv_ultima_coleta = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-                    st.success(f"Inventário coletado em {time.time()-t0:.1f}s — {len(df_inv):,} escola(s) no total.")
+                    st.success(f"Inventário coletado em {time.time()-t0:.1f}s — {len(df_inv):,} escola(s) únicas.")
 
                     # Log
                     html_log = "".join(
@@ -1178,6 +1231,9 @@ with t5:
                     erros.append(f"Zyxel: {e}")
 
             for e in erros: st.error(e)
+
+            # Deduplicação: mantém a melhor entrada por INEP
+            res_bm = deduplicar_por_inep(res_bm)
 
             if res_bm:
                 dfm = pd.DataFrame.from_dict(res_bm, orient="index").reset_index()
