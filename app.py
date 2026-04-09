@@ -165,19 +165,26 @@ def salvar_contas(contas):
     except Exception:
         pass
 
+# Prefixo usado para identificar chaves de conta nos Secrets raiz
+_CONTA_PREFIXOS = ("Conta_", "conta_", "CONTA_", "admin")
+
 def carregar_contas():
     """
     Lê as contas dos Streamlit Secrets.
-    Tenta três formatos diferentes para máxima compatibilidade:
+    Suporta quatro formatos:
 
-    Formato 1 — seção [contas] (recomendado):
+    Formato 1 — seção [contas] (ideal):
         [contas]
         Conta_AC1 = "chave1"
 
-    Formato 2 — lista JSON na chave contas_json:
+    Formato 2 — chaves na raiz com prefixo Conta_:
+        Conta_AC1 = "chave1"
+        admin0    = "chave2"
+
+    Formato 3 — JSON na chave contas_json:
         contas_json = '[{"apelido":"Conta AC1","api_key":"chave1"}]'
 
-    Fallback — arquivo config_contas.json local (desenvolvimento).
+    Formato 4 — fallback arquivo local (desenvolvimento).
     """
     # Formato 1: seção [contas]
     try:
@@ -193,14 +200,35 @@ def carregar_contas():
     except Exception:
         pass
 
-    # Formato 2: JSON na chave contas_json
+    # Formato 2: chaves soltas na raiz que parecem contas Ubiquiti
+    # O Streamlit Cloud às vezes não processa seções TOML corretamente
+    try:
+        todas = dict(st.secrets)
+        contas_raiz = []
+        chaves_ignorar = {"contas_json"}
+        for k, v in todas.items():
+            if k in chaves_ignorar:
+                continue
+            v_str = str(v).strip()
+            # Considera conta se: começa com prefixo conhecido OU o valor parece uma API key
+            # (string sem espaços com 20+ chars)
+            eh_prefixo = any(k.startswith(p) for p in _CONTA_PREFIXOS)
+            eh_apikey  = len(v_str) >= 20 and " " not in v_str and isinstance(v, str)
+            if eh_prefixo or eh_apikey:
+                contas_raiz.append({"apelido": k, "api_key": v_str})
+        if contas_raiz:
+            return contas_raiz
+    except Exception:
+        pass
+
+    # Formato 3: JSON na chave contas_json
     try:
         if "contas_json" in st.secrets:
             return json.loads(st.secrets["contas_json"])
     except Exception:
         pass
 
-    # Fallback local para desenvolvimento
+    # Formato 4: fallback arquivo local
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -629,17 +657,21 @@ with st.sidebar:
         # Diagnóstico — ajuda a identificar problema de formato
         with st.expander("🔍 Diagnóstico Secrets", expanded=True):
             try:
-                chaves_disponiveis = list(st.secrets.keys())
-                st.caption(f"Chaves encontradas nos Secrets: `{chaves_disponiveis}`")
+                todas = dict(st.secrets)
+                chaves = list(todas.keys())
+                st.caption(f"Chaves encontradas: `{chaves}`")
                 if "contas" in st.secrets:
-                    itens = dict(st.secrets["contas"])
-                    st.caption(f"Entradas em [contas]: {len(itens)}")
-                    for k, v in list(itens.items())[:3]:
-                        st.caption(f"  • {k}: {'✅ preenchida' if str(v).strip() else '❌ vazia'}")
+                    st.caption(f"✅ Seção [contas] encontrada com {len(dict(st.secrets['contas']))} entradas.")
                 else:
-                    st.caption("❌ Seção [contas] não encontrada nos Secrets.")
-                    st.caption("Verifique se o formato está correto:")
-                    st.code("[contas]\nConta_AC1 = \"sua_chave\"", language="toml")
+                    st.caption("⚠️ Seção [contas] não encontrada — tentando ler chaves soltas na raiz.")
+                    candidatas = [k for k in chaves if any(k.startswith(p) for p in _CONTA_PREFIXOS)
+                                  or (len(str(todas[k])) >= 20 and " " not in str(todas[k]))]
+                    st.caption(f"Chaves candidatas a conta: `{candidatas}`")
+                    if candidatas:
+                        st.caption(f"✅ {len(candidatas)} conta(s) detectada(s) pelo formato alternativo.")
+                    else:
+                        st.caption("❌ Nenhuma conta detectada. Use o formato abaixo:")
+                        st.code("[contas]\nConta_AC1 = \"sua_chave\"", language="toml")
             except Exception as ex:
                 st.caption(f"Erro ao ler Secrets: {ex}")
 
