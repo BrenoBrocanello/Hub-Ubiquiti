@@ -46,6 +46,12 @@ st.markdown("""
     gap: 10px;
     margin: 20px 0 24px 0;
 }
+.saas-grid-4 {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin: 20px 0 24px 0;
+}
 .saas-card {
     background: #161b27;
     border: 1px solid #1e2535;
@@ -143,14 +149,6 @@ st.markdown("""
     margin: 20px 0;
 }
 
-.upload-section {
-    background: #161b27;
-    border: 1px solid #1e2535;
-    border-radius: 10px;
-    padding: 16px 20px;
-    margin-bottom: 12px;
-}
-
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #1e2535; border-radius: 99px; }
@@ -200,11 +198,13 @@ def carregar_provedores() -> dict:
 # SESSION STATE
 # ═══════════════════════════════════════════════════════════════
 for k, v in {
-    "contas":          None,
-    "provedores":      None,
-    "df_resultado":    None,
-    "relatorio":       [],
-    "ultima_consulta": None,
+    "contas":            None,
+    "provedores":        None,
+    "df_resultado":      None,
+    "relatorio":         [],
+    "ultima_consulta":   None,
+    "df_inventario":     None,
+    "inv_ultima_coleta": None,
 }.items():
     if k not in st.session_state:
         if k == "contas":
@@ -278,6 +278,33 @@ def buscar_ineps_ubiquiti(api_key: str, apelido: str, ineps: set) -> dict:
                 break
     return out
 
+def coletar_todos_hosts_ubiquiti(contas: list) -> tuple:
+    """Retorna TODOS os hosts de todas as contas, sem filtro por INEP."""
+    rows  = []
+    erros = []
+    for c in contas:
+        if not c.get("api_key", "").strip():
+            continue
+        try:
+            hosts = get_paginated_hosts(c["api_key"])
+            for h in hosts:
+                d      = extrair_host(h)
+                inep   = extrair_inep_do_nome(d["nome"])
+                status = "ONLINE" if d["estado"] == "connected" else "OFFLINE"
+                rows.append({
+                    "INEP":            inep or "—",
+                    "Nome no Console": d["nome"],
+                    "Status Rede":     f"UBIQUITI - {status}",
+                    "Plataforma":      "UBIQUITI",
+                    "Uptime WAN":      d["uptime"],
+                    "ISP":             d["isp"],
+                    "Conta":           c["apelido"],
+                    "IP Externo":      d["ip"],
+                })
+        except Exception as e:
+            erros.append(f"{c['apelido']}: {e}")
+    return rows, erros
+
 def coletar_todos_isps_ubiquiti(contas: list) -> tuple:
     isps  = set()
     erros = []
@@ -312,7 +339,6 @@ def testar_conta(api_key: str):
 # OMADA — PROCESSAMENTO DO EXPORT
 # ═══════════════════════════════════════════════════════════════
 def extrair_inep_do_nome(nome: str):
-    """Extrai sequência de 8 dígitos (INEP) do nome do site/controller."""
     matches = re.findall(r'\b(\d{8})\b', str(nome))
     return matches[-1] if matches else None
 
@@ -343,58 +369,65 @@ def processar_export_omada(df_omada: pd.DataFrame) -> dict:
         }
     return resultado
 
+def processar_export_omada_completo(df_omada: pd.DataFrame) -> list:
+    """Versão para inventário — retorna lista de todas as linhas, não só cruzadas."""
+    rows = []
+    df_omada.columns = [str(c).strip().upper() for c in df_omada.columns]
+    if "NAME" not in df_omada.columns or "STATUS" not in df_omada.columns:
+        return rows
+    for _, row in df_omada.iterrows():
+        nome   = str(row.get("NAME", "")).strip()
+        status = str(row.get("STATUS", "")).strip().upper()
+        inep   = extrair_inep_do_nome(nome)
+        status_raw = "ONLINE" if status == "ONLINE" else "OFFLINE"
+        ip_externo = "—"
+        if "IP ADDRESS" in df_omada.columns:
+            ips = str(row.get("IP ADDRESS", "")).split(",")
+            ip_externo = ips[-1].strip() if ips else "—"
+        rows.append({
+            "INEP":            inep or "—",
+            "Nome no Console": nome,
+            "Status Rede":     f"OMADA - {status_raw}",
+            "Plataforma":      "OMADA",
+            "Uptime WAN":      "—",
+            "ISP":             "—",
+            "Conta":           "Omada Cloud",
+            "IP Externo":      ip_externo,
+        })
+    return rows
+
 # ═══════════════════════════════════════════════════════════════
 # ZYXEL — PROCESSAMENTO DO EXPORT CSV
 # ═══════════════════════════════════════════════════════════════
-# Mapeamento de status Zyxel → status interno
 ZYXEL_STATUS_MAP = {
-    "OK":                   "ONLINE",
-    "DEVICE ALERTED":       "ALERTA",
-    "DEVICE OFFLINE":       "OFFLINE",
-    "DEVICES UNREACHABLE":  "OFFLINE",
-    "NO DEVICES":           "SEM DISPOSITIVO",
+    "OK":                  "ONLINE",
+    "DEVICE ALERTED":      "ALERTA",
+    "DEVICE OFFLINE":      "OFFLINE",
+    "DEVICES UNREACHABLE": "OFFLINE",
+    "NO DEVICES":          "SEM DISPOSITIVO",
 }
 
 def processar_export_zyxel(df_zyxel: pd.DataFrame) -> dict:
-    """
-    Processa o CSV exportado do Zyxel Nebula (Overviews > Sites).
-    Colunas esperadas (PT): Estado, Nome, Tags, Dispositivos, etc.
-    Também aceita versão em inglês: Status, Name, etc.
-    """
     resultado = {}
-
-    # Normaliza colunas — suporta CSV em PT e EN
-    col_map = {}
+    col_map   = {}
     for col in df_zyxel.columns:
         cu = str(col).strip().upper()
-        if cu in ("ESTADO", "STATUS"):
-            col_map["status"] = col
-        elif cu in ("NOME", "NAME"):
-            col_map["nome"] = col
-        elif cu in ("DISPOSITIVOS OFFLINE", "OFFLINE DEVICES"):
-            col_map["offline"] = col
-        elif cu in ("DISPOSITIVOS", "DEVICES"):
-            col_map["total_dev"] = col
-        elif cu in ("% OFFLINE", "% OFFLINE DEVICES"):
-            col_map["pct_offline"] = col
-
+        if cu in ("ESTADO", "STATUS"):               col_map["status"]      = col
+        elif cu in ("NOME", "NAME"):                  col_map["nome"]        = col
+        elif cu in ("DISPOSITIVOS OFFLINE", "OFFLINE DEVICES"): col_map["offline"] = col
+        elif cu in ("DISPOSITIVOS", "DEVICES"):       col_map["total_dev"]   = col
+        elif cu in ("% OFFLINE", "% OFFLINE DEVICES"):col_map["pct_offline"] = col
     if "status" not in col_map or "nome" not in col_map:
         return resultado
-
     for _, row in df_zyxel.iterrows():
-        nome       = str(row[col_map["nome"]]).strip()
-        status_raw = str(row[col_map["status"]]).strip().upper()
-        inep       = extrair_inep_do_nome(nome)
-        if not inep:
-            continue
-
+        nome           = str(row[col_map["nome"]]).strip()
+        status_raw     = str(row[col_map["status"]]).strip().upper()
+        inep           = extrair_inep_do_nome(nome)
+        if not inep: continue
         status_interno = ZYXEL_STATUS_MAP.get(status_raw, "OFFLINE")
-
-        # Detalhes extras opcionais
-        total_dev   = str(row.get(col_map.get("total_dev",  ""), "—")).strip()
-        offline_dev = str(row.get(col_map.get("offline",    ""), "—")).strip()
-        pct_offline = str(row.get(col_map.get("pct_offline",""), "—")).strip()
-
+        total_dev      = str(row.get(col_map.get("total_dev",  ""), "—")).strip()
+        offline_dev    = str(row.get(col_map.get("offline",    ""), "—")).strip()
+        pct_offline    = str(row.get(col_map.get("pct_offline",""), "—")).strip()
         resultado[inep] = {
             "Status Rede":       f"ZYXEL - {status_interno}",
             "Plataforma":        "ZYXEL",
@@ -407,23 +440,53 @@ def processar_export_zyxel(df_zyxel: pd.DataFrame) -> dict:
         }
     return resultado
 
+def processar_export_zyxel_completo(df_zyxel: pd.DataFrame) -> list:
+    """Versão para inventário — retorna todas as linhas."""
+    rows    = []
+    col_map = {}
+    for col in df_zyxel.columns:
+        cu = str(col).strip().upper()
+        if cu in ("ESTADO", "STATUS"):                col_map["status"]      = col
+        elif cu in ("NOME", "NAME"):                   col_map["nome"]        = col
+        elif cu in ("DISPOSITIVOS OFFLINE", "OFFLINE DEVICES"): col_map["offline"] = col
+        elif cu in ("DISPOSITIVOS", "DEVICES"):        col_map["total_dev"]   = col
+        elif cu in ("% OFFLINE", "% OFFLINE DEVICES"): col_map["pct_offline"] = col
+    if "status" not in col_map or "nome" not in col_map:
+        return rows
+    for _, row in df_zyxel.iterrows():
+        nome           = str(row[col_map["nome"]]).strip()
+        status_raw     = str(row[col_map["status"]]).strip().upper()
+        inep           = extrair_inep_do_nome(nome)
+        status_interno = ZYXEL_STATUS_MAP.get(status_raw, "OFFLINE")
+        total_dev      = str(row.get(col_map.get("total_dev",  ""), "—")).strip()
+        offline_dev    = str(row.get(col_map.get("offline",    ""), "—")).strip()
+        pct_offline    = str(row.get(col_map.get("pct_offline",""), "—")).strip()
+        rows.append({
+            "INEP":              inep or "—",
+            "Nome no Console":   nome,
+            "Status Rede":       f"ZYXEL - {status_interno}",
+            "Plataforma":        "ZYXEL",
+            "Uptime WAN":        f"{pct_offline} offline" if pct_offline != "—" else "—",
+            "ISP":               "—",
+            "Conta":             "Zyxel Nebula",
+            "IP Externo":        "—",
+            "Devices (tot/off)": f"{total_dev} / {offline_dev}",
+        })
+    return rows
+
 # ═══════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════
 COR_STATUS = {
-    # Ubiquiti
-    "UBIQUITI - ONLINE":          "background:#052e16; color:#22c55e; font-weight:600",
-    "UBIQUITI - OFFLINE":         "background:#2d0a0a; color:#ef4444; font-weight:600",
-    # Omada
-    "OMADA - ONLINE":             "background:#0a1f2e; color:#38bdf8; font-weight:600",
-    "OMADA - OFFLINE":            "background:#2d1a0a; color:#fb923c; font-weight:600",
-    # Zyxel
-    "ZYXEL - ONLINE":             "background:#1a0a2e; color:#a855f7; font-weight:600",
-    "ZYXEL - OFFLINE":            "background:#2d0a1f; color:#f472b6; font-weight:600",
-    "ZYXEL - ALERTA":             "background:#2d2200; color:#facc15; font-weight:600",
-    "ZYXEL - SEM DISPOSITIVO":    "background:#1a1f2e; color:#6b7280; font-weight:600",
-    # Não encontrado
-    "NÃO ENCONTRADO":             "background:#1a1f2e; color:#374151; font-weight:600",
+    "UBIQUITI - ONLINE":       "background:#052e16; color:#22c55e; font-weight:600",
+    "UBIQUITI - OFFLINE":      "background:#2d0a0a; color:#ef4444; font-weight:600",
+    "OMADA - ONLINE":          "background:#0a1f2e; color:#38bdf8; font-weight:600",
+    "OMADA - OFFLINE":         "background:#2d1a0a; color:#fb923c; font-weight:600",
+    "ZYXEL - ONLINE":          "background:#1a0a2e; color:#a855f7; font-weight:600",
+    "ZYXEL - OFFLINE":         "background:#2d0a1f; color:#f472b6; font-weight:600",
+    "ZYXEL - ALERTA":          "background:#2d2200; color:#facc15; font-weight:600",
+    "ZYXEL - SEM DISPOSITIVO": "background:#1a1f2e; color:#6b7280; font-weight:600",
+    "NÃO ENCONTRADO":          "background:#1a1f2e; color:#374151; font-weight:600",
 }
 
 def cor_status(val):
@@ -524,9 +587,10 @@ st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
 # ═══════════════════════════════════════════════════════════════
 # ABAS
 # ═══════════════════════════════════════════════════════════════
-t1, t2, t3, t4, t5, t6, t7 = st.tabs([
+t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
     "📊 Processar Planilha",
     "📋 Chamados",
+    "🌐 Inventário Geral",
     "🏢 Provedores",
     "🔍 Busca Manual",
     "🛠️ Raio-X da Conta",
@@ -548,7 +612,6 @@ with t1:
 
     st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
 
-    # ── 1. Planilha de chamados ──
     st.markdown("#### 1. Planilha de Chamados (obrigatória)")
     col_up, col_inf = st.columns([3, 1])
     with col_up:
@@ -560,18 +623,14 @@ with t1:
         if arquivo:
             df_prev = pd.read_excel(arquivo, dtype={"INEP": str})
             arquivo.seek(0)
-            n_ineps = (
-                df_prev["INEP"].dropna()
-                .astype(str).str.replace(r'\.0$', '', regex=True).str.strip().nunique()
-            )
-            st.metric("Chamados",     len(df_prev))
+            n_ineps = df_prev["INEP"].dropna().astype(str).str.replace(r'\.0$','',regex=True).str.strip().nunique()
+            st.metric("Chamados", len(df_prev))
             st.metric("INEPs únicos", n_ineps)
         else:
             st.info("Aguardando...")
 
     st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
 
-    # ── 2. Export Omada ──
     st.markdown("#### 2. Export do Omada Cloud (opcional)")
     st.caption("Omada → On Premise Systems → botão **Export** → faça upload aqui.")
     col_om, col_om_inf = st.columns([3, 1])
@@ -583,22 +642,18 @@ with t1:
             arquivo_omada.seek(0)
             n_on  = (df_om_prev["STATUS"].str.upper() == "ONLINE").sum()  if "STATUS" in df_om_prev.columns else "—"
             n_off = (df_om_prev["STATUS"].str.upper() == "OFFLINE").sum() if "STATUS" in df_om_prev.columns else "—"
-            st.metric("Controllers",     len(df_om_prev))
+            st.metric("Controllers", len(df_om_prev))
             st.metric("Online / Offline", f"{n_on} / {n_off}")
         else:
             st.info("Opcional.")
 
     st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
 
-    # ── 3. Export Zyxel ──
     st.markdown("#### 3. Export do Zyxel Nebula (opcional)")
-    st.caption("Zyxel Nebula → Overview → Sites → botão de download (CSV) → faça upload aqui.")
+    st.caption("Zyxel Nebula → Overview → Sites → ícone de download (CSV) → faça upload aqui.")
     col_zy, col_zy_inf = st.columns([3, 1])
     with col_zy:
-        arquivo_zyxel = st.file_uploader(
-            "Export Zyxel (.csv)",
-            type=["csv"], key="up_zyxel"
-        )
+        arquivo_zyxel = st.file_uploader("Export Zyxel (.csv)", type=["csv"], key="up_zyxel")
     with col_zy_inf:
         if arquivo_zyxel:
             df_zy_prev = pd.read_csv(arquivo_zyxel)
@@ -606,14 +661,11 @@ with t1:
             col_st = next((c for c in df_zy_prev.columns if c.strip().upper() in ("ESTADO","STATUS")), None)
             if col_st:
                 n_ok  = (df_zy_prev[col_st].str.upper() == "OK").sum()
-                n_off = df_zy_prev[col_st].str.upper().isin(
-                    ["DEVICE OFFLINE","DEVICES UNREACHABLE"]
-                ).sum()
+                n_off = df_zy_prev[col_st].str.upper().isin(["DEVICE OFFLINE","DEVICES UNREACHABLE"]).sum()
                 n_alr = (df_zy_prev[col_st].str.upper() == "DEVICE ALERTED").sum()
-                st.metric("Sites",         len(df_zy_prev))
-                st.metric("OK / Offline",  f"{n_ok} / {n_off}")
-                if n_alr:
-                    st.metric("Em alerta", n_alr)
+                st.metric("Sites", len(df_zy_prev))
+                st.metric("OK / Offline", f"{n_ok} / {n_off}")
+                if n_alr: st.metric("Em alerta", n_alr)
             else:
                 st.metric("Sites", len(df_zy_prev))
         else:
@@ -621,7 +673,6 @@ with t1:
 
     st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
 
-    # ── Validação e botão ──
     if not arquivo:
         st.info("Faça upload da planilha de chamados para continuar.")
     elif not alvo and not arquivo_omada and not arquivo_zyxel:
@@ -641,28 +692,23 @@ with t1:
 
             ineps_set = set(
                 df_raw["INEP"].dropna()
-                .astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+                .astype(str).str.replace(r'\.0$','',regex=True).str.strip()
             )
             todos = {}
             log   = []
             t0    = time.time()
 
-            # ── Ubiquiti ──
             if alvo:
                 prog = st.progress(0.0, text="Consultando Ubiquiti...")
                 with ThreadPoolExecutor(max_workers=min(len(alvo), 5)) as ex:
-                    futs = {
-                        ex.submit(buscar_ineps_ubiquiti, c["api_key"], c["apelido"], ineps_set): c["apelido"]
-                        for c in alvo
-                    }
+                    futs = {ex.submit(buscar_ineps_ubiquiti, c["api_key"], c["apelido"], ineps_set): c["apelido"] for c in alvo}
                     done = 0
                     for fut in as_completed(futs):
                         ap = futs[fut]
                         try:
                             res = fut.result()
                             for inep, dados in res.items():
-                                if inep not in todos:
-                                    todos[inep] = dados
+                                if inep not in todos: todos[inep] = dados
                             isps_novos = {v["ISP"] for v in res.values() if v.get("ISP","—") != "—"}
                             qt = mesclar_isps_novos(isps_novos)
                             log.append(("ok", f"Ubiquiti {ap}: {len(res)} escola(s) | {qt} ISP(s) novo(s)"))
@@ -672,21 +718,17 @@ with t1:
                         prog.progress(done / len(alvo), text=f"Ubiquiti {done}/{len(alvo)}...")
                 prog.progress(1.0, text="Ubiquiti concluído.")
 
-            # ── Omada ──
             if arquivo_omada:
                 try:
                     arquivo_omada.seek(0)
                     res_om = processar_export_omada(pd.read_excel(arquivo_omada))
-                    cruzados = sum(
-                        1 for inep, d in res_om.items()
-                        if inep in ineps_set and inep not in todos
-                        and not todos.update({inep: d})  # side-effect update
-                    )
+                    cruzados = sum(1 for inep, d in res_om.items()
+                                   if inep in ineps_set and inep not in todos
+                                   and not todos.update({inep: d}))
                     log.append(("ok", f"Omada: {cruzados} escola(s) cruzada(s) de {len(res_om)} controllers"))
                 except Exception as e:
                     log.append(("err", f"Omada export: {e}"))
 
-            # ── Zyxel ──
             if arquivo_zyxel:
                 try:
                     arquivo_zyxel.seek(0)
@@ -700,27 +742,19 @@ with t1:
                 except Exception as e:
                     log.append(("err", f"Zyxel export: {e}"))
 
-            # ── Montar DataFrame final ──
             df_f = df_raw.copy()
-            df_f["INEP_K"] = df_f["INEP"].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+            df_f["INEP_K"] = df_f["INEP"].astype(str).str.replace(r'\.0$','',regex=True).str.strip()
             for col, pad in [
-                ("Status Rede",     "NÃO ENCONTRADO"),
-                ("Plataforma",      "—"),
-                ("Uptime WAN",      "—"),
-                ("ISP",             "—"),
-                ("Conta",           "—"),
-                ("IP Externo",      "—"),
-                ("Nome no Console", "—"),
+                ("Status Rede","NÃO ENCONTRADO"),("Plataforma","—"),("Uptime WAN","—"),
+                ("ISP","—"),("Conta","—"),("IP Externo","—"),("Nome no Console","—"),
             ]:
-                df_f[col] = df_f["INEP_K"].map(
-                    lambda x, c=col, p=pad: todos.get(x, {}).get(c, p)
-                )
+                df_f[col] = df_f["INEP_K"].map(lambda x, c=col, p=pad: todos.get(x, {}).get(c, p))
             df_f.drop(columns=["INEP_K"], inplace=True)
 
             st.session_state.df_resultado    = df_f
             st.session_state.relatorio       = log
             st.session_state.ultima_consulta = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-            st.success(f"Concluído em {time.time()-t0:.1f}s — {len(todos)} escola(s) localizada(s) no total.")
+            st.success(f"Concluído em {time.time()-t0:.1f}s — {len(todos)} escola(s) localizada(s).")
             st.info("Acesse a aba '📋 Chamados' para ver os resultados.")
 
 # ─────────────────────────────────────────
@@ -740,60 +774,37 @@ with t2:
             )
             st.markdown(f'<div class="log-box">{html}</div>', unsafe_allow_html=True)
 
-        # Cards
         total   = len(df)
-        online  = df["Status Rede"].str.contains("ONLINE",    na=False).sum()
-        offline = df["Status Rede"].str.contains("OFFLINE",   na=False).sum()
-        n_ubi   = df["Status Rede"].str.contains("UBIQUITI",  na=False).sum()
-        n_om    = df["Status Rede"].str.contains("OMADA",     na=False).sum()
-        n_zy    = df["Status Rede"].str.contains("ZYXEL",     na=False).sum()
+        online  = df["Status Rede"].str.contains("ONLINE",   na=False).sum()
+        offline = df["Status Rede"].str.contains("OFFLINE",  na=False).sum()
+        n_ubi   = df["Status Rede"].str.contains("UBIQUITI", na=False).sum()
+        n_om    = df["Status Rede"].str.contains("OMADA",    na=False).sum()
+        n_zy    = df["Status Rede"].str.contains("ZYXEL",    na=False).sum()
 
         st.markdown(f"""
         <div class="saas-grid">
-          <div class="saas-card">
-            <div class="saas-card-label">Total chamados</div>
-            <div class="saas-card-value c-blue">{total}</div>
-            <div class="saas-card-sub">planilha importada</div>
-          </div>
-          <div class="saas-card">
-            <div class="saas-card-label">Online</div>
-            <div class="saas-card-value c-green">{online}</div>
-            <div class="saas-card-sub">{f"{online/total*100:.0f}%" if total else "—"}</div>
-          </div>
-          <div class="saas-card">
-            <div class="saas-card-label">Offline / Alerta</div>
-            <div class="saas-card-value c-red">{offline}</div>
-            <div class="saas-card-sub">{f"{offline/total*100:.0f}%" if total else "—"}</div>
-          </div>
-          <div class="saas-card">
-            <div class="saas-card-label">Ubiquiti</div>
-            <div class="saas-card-value c-blue">{n_ubi}</div>
-            <div class="saas-card-sub">identificados</div>
-          </div>
-          <div class="saas-card">
-            <div class="saas-card-label">Omada</div>
-            <div class="saas-card-value c-teal">{n_om}</div>
-            <div class="saas-card-sub">identificados</div>
-          </div>
-          <div class="saas-card">
-            <div class="saas-card-label">Zyxel</div>
-            <div class="saas-card-value c-purple">{n_zy}</div>
-            <div class="saas-card-sub">identificados</div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+          <div class="saas-card"><div class="saas-card-label">Total chamados</div>
+            <div class="saas-card-value c-blue">{total}</div><div class="saas-card-sub">planilha importada</div></div>
+          <div class="saas-card"><div class="saas-card-label">Online</div>
+            <div class="saas-card-value c-green">{online}</div><div class="saas-card-sub">{f"{online/total*100:.0f}%" if total else "—"}</div></div>
+          <div class="saas-card"><div class="saas-card-label">Offline / Alerta</div>
+            <div class="saas-card-value c-red">{offline}</div><div class="saas-card-sub">{f"{offline/total*100:.0f}%" if total else "—"}</div></div>
+          <div class="saas-card"><div class="saas-card-label">Ubiquiti</div>
+            <div class="saas-card-value c-blue">{n_ubi}</div><div class="saas-card-sub">identificados</div></div>
+          <div class="saas-card"><div class="saas-card-label">Omada</div>
+            <div class="saas-card-value c-teal">{n_om}</div><div class="saas-card-sub">identificados</div></div>
+          <div class="saas-card"><div class="saas-card-label">Zyxel</div>
+            <div class="saas-card-value c-purple">{n_zy}</div><div class="saas-card-sub">identificados</div></div>
+        </div>""", unsafe_allow_html=True)
 
-        # Filtros
         with st.expander("⚙️ Filtros", expanded=True):
             f1, f2, f3, f4, f5, f6 = st.columns(6)
-
             op_st   = sorted(df["Status Rede"].dropna().unique().tolist())
             op_plat = sorted(df["Plataforma"].dropna().unique().tolist()) if "Plataforma" in df.columns else []
-            op_isp  = sorted([v for v in df["ISP"].dropna().unique().tolist() if v not in ("—", "")])
+            op_isp  = sorted([v for v in df["ISP"].dropna().unique().tolist() if v not in ("—","")])
             op_uf   = sorted(df["UF"].dropna().unique().tolist())      if "UF"       in df.columns else []
             op_an   = sorted(df["Analista"].dropna().unique().tolist()) if "Analista" in df.columns else []
             op_co   = sorted(df["Conta"].dropna().unique().tolist())
-
             fs = f1.multiselect("Status Rede",    op_st,   default=op_st, key="fs_ch")
             fp = f2.multiselect("Plataforma",     op_plat, default=[],    key="fp_ch")
             fi = f3.multiselect("Provedor (ISP)", op_isp,  default=[],    key="fi_ch")
@@ -808,38 +819,226 @@ with t2:
         if fa and "Analista" in df.columns:  dff = dff[dff["Analista"].isin(fa)]
         if fc:                               dff = dff[dff["Conta"].isin(fc)]
 
-        prio = ["Ticket#","UF","Cidade","Escola","INEP","Analista",
-                "Status Rede","Plataforma","Uptime WAN","ISP","Conta",
-                "IP Externo","Nome no Console","Dias Abertos (Corridos)"]
+        prio = ["Ticket#","UF","Cidade","Escola","INEP","Analista","Status Rede","Plataforma",
+                "Uptime WAN","ISP","Conta","IP Externo","Nome no Console","Dias Abertos (Corridos)"]
         cols = [c for c in prio if c in dff.columns] + [c for c in dff.columns if c not in prio]
 
-        st.dataframe(
-            dff[cols].style.map(cor_status, subset=["Status Rede"]),
-            use_container_width=True, height=500
-        )
+        st.dataframe(dff[cols].style.map(cor_status, subset=["Status Rede"]),
+                     use_container_width=True, height=500)
         st.caption(f"{len(dff):,} de {len(df):,} chamados exibidos")
 
         ca, cb, _ = st.columns([1, 1, 3])
-        ca.download_button("⬇️ Exportar filtrado",
-            to_xlsx(dff[cols]),
+        ca.download_button("⬇️ Exportar filtrado", to_xlsx(dff[cols]),
             f"chamados_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        cb.download_button("⬇️ Exportar completo",
-            to_xlsx(df[cols]),
+        cb.download_button("⬇️ Exportar completo", to_xlsx(df[cols]),
             f"chamados_completo_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ─────────────────────────────────────────
-# ABA 3 — PROVEDORES
+# ABA 3 — INVENTÁRIO GERAL
 # ─────────────────────────────────────────
 with t3:
+    st.markdown("### 🌐 Inventário Geral de Escolas")
+    st.write(
+        "Coleta **todas** as escolas de todas as plataformas, independente de chamados abertos. "
+        "Ubiquiti é buscado via API. Omada e Zyxel via upload dos exports."
+    )
+
+    st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
+
+    # Uploads Omada e Zyxel para o inventário
+    col_inv_om, col_inv_zy = st.columns(2)
+    with col_inv_om:
+        st.caption("🔵 **Omada** — export do portal On Premise Systems")
+        inv_omada = st.file_uploader("Export Omada (.xlsx)", type=["xlsx"], key="inv_omada")
+        if inv_omada:
+            df_inv_om_prev = pd.read_excel(inv_omada)
+            inv_omada.seek(0)
+            st.caption(f"{len(df_inv_om_prev)} controllers carregados")
+    with col_inv_zy:
+        st.caption("🟣 **Zyxel** — export CSV do Nebula (Overview → Sites)")
+        inv_zyxel = st.file_uploader("Export Zyxel (.csv)", type=["csv"], key="inv_zyxel")
+        if inv_zyxel:
+            df_inv_zy_prev = pd.read_csv(inv_zyxel)
+            inv_zyxel.seek(0)
+            st.caption(f"{len(df_inv_zy_prev)} sites carregados")
+
+    st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
+
+    col_btn_inv, col_reset_inv, _ = st.columns([2, 2, 4])
+    with col_btn_inv:
+        if st.button("🔄 Coletar Inventário Completo", type="primary", use_container_width=True):
+            if not alvo and not inv_omada and not inv_zyxel:
+                st.warning("Configure ao menos uma fonte: conta Ubiquiti, export Omada ou export Zyxel.")
+            else:
+                todas_linhas = []
+                log_inv      = []
+                t0           = time.time()
+
+                # ── Ubiquiti — todas as contas em paralelo ──
+                if alvo:
+                    prog_inv = st.progress(0.0, text="Coletando Ubiquiti...")
+                    with ThreadPoolExecutor(max_workers=min(len(alvo), 5)) as ex:
+                        futs_inv = {
+                            ex.submit(coletar_todos_hosts_ubiquiti, [c]): c["apelido"]
+                            for c in alvo
+                        }
+                        done_inv = 0
+                        for fut in as_completed(futs_inv):
+                            ap = futs_inv[fut]
+                            try:
+                                rows_c, erros_c = fut.result()
+                                todas_linhas.extend(rows_c)
+                                for e in erros_c: log_inv.append(("err", e))
+                                log_inv.append(("ok", f"Ubiquiti {ap}: {len(rows_c)} host(s)"))
+                            except Exception as e:
+                                log_inv.append(("err", f"Ubiquiti {ap}: {e}"))
+                            done_inv += 1
+                            prog_inv.progress(done_inv / len(alvo), text=f"Ubiquiti {done_inv}/{len(alvo)}...")
+                    prog_inv.progress(1.0, text="Ubiquiti concluído.")
+
+                # ── Omada ──
+                if inv_omada:
+                    try:
+                        inv_omada.seek(0)
+                        rows_om = processar_export_omada_completo(pd.read_excel(inv_omada))
+                        todas_linhas.extend(rows_om)
+                        log_inv.append(("ok", f"Omada: {len(rows_om)} controller(s)"))
+                    except Exception as e:
+                        log_inv.append(("err", f"Omada: {e}"))
+
+                # ── Zyxel ──
+                if inv_zyxel:
+                    try:
+                        inv_zyxel.seek(0)
+                        rows_zy = processar_export_zyxel_completo(pd.read_csv(inv_zyxel))
+                        todas_linhas.extend(rows_zy)
+                        log_inv.append(("ok", f"Zyxel: {len(rows_zy)} site(s)"))
+                    except Exception as e:
+                        log_inv.append(("err", f"Zyxel: {e}"))
+
+                if todas_linhas:
+                    df_inv = pd.DataFrame(todas_linhas)
+                    # Garante ordem das colunas
+                    col_order = ["INEP","Nome no Console","Status Rede","Plataforma",
+                                 "Uptime WAN","ISP","Conta","IP Externo"]
+                    df_inv = df_inv[[c for c in col_order if c in df_inv.columns] +
+                                    [c for c in df_inv.columns if c not in col_order]]
+                    st.session_state.df_inventario     = df_inv
+                    st.session_state.inv_ultima_coleta = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                    st.success(f"Inventário coletado em {time.time()-t0:.1f}s — {len(df_inv):,} escola(s) no total.")
+
+                    # Log
+                    html_log = "".join(
+                        f'<div class="log-{"ok" if tp=="ok" else "err"}">{"✓" if tp=="ok" else "✗"}  {m}</div>'
+                        for tp, m in log_inv
+                    )
+                    st.markdown(f'<div class="log-box">{html_log}</div>', unsafe_allow_html=True)
+                else:
+                    st.error("Nenhuma escola coletada. Verifique as fontes.")
+
+    with col_reset_inv:
+        if st.button("🗑️ Limpar Inventário", use_container_width=True):
+            st.session_state.df_inventario     = None
+            st.session_state.inv_ultima_coleta = None
+            st.rerun()
+
+    # ── Exibição do inventário ──
+    if st.session_state.df_inventario is not None:
+        df_inv = st.session_state.df_inventario
+        st.markdown(f'<div class="ts-pill">🕐 {st.session_state.inv_ultima_coleta}</div>', unsafe_allow_html=True)
+
+        # Cards
+        total_inv   = len(df_inv)
+        online_inv  = df_inv["Status Rede"].str.contains("ONLINE",   na=False).sum()
+        offline_inv = df_inv["Status Rede"].str.contains("OFFLINE",  na=False).sum()
+        n_ubi_inv   = df_inv["Status Rede"].str.contains("UBIQUITI", na=False).sum()
+        n_om_inv    = df_inv["Status Rede"].str.contains("OMADA",    na=False).sum()
+        n_zy_inv    = df_inv["Status Rede"].str.contains("ZYXEL",    na=False).sum()
+
+        st.markdown(f"""
+        <div class="saas-grid">
+          <div class="saas-card"><div class="saas-card-label">Total escolas</div>
+            <div class="saas-card-value c-blue">{total_inv:,}</div><div class="saas-card-sub">todas as plataformas</div></div>
+          <div class="saas-card"><div class="saas-card-label">Online</div>
+            <div class="saas-card-value c-green">{online_inv:,}</div>
+            <div class="saas-card-sub">{f"{online_inv/total_inv*100:.0f}%" if total_inv else "—"}</div></div>
+          <div class="saas-card"><div class="saas-card-label">Offline / Alerta</div>
+            <div class="saas-card-value c-red">{offline_inv:,}</div>
+            <div class="saas-card-sub">{f"{offline_inv/total_inv*100:.0f}%" if total_inv else "—"}</div></div>
+          <div class="saas-card"><div class="saas-card-label">Ubiquiti</div>
+            <div class="saas-card-value c-blue">{n_ubi_inv:,}</div><div class="saas-card-sub">hosts</div></div>
+          <div class="saas-card"><div class="saas-card-label">Omada</div>
+            <div class="saas-card-value c-teal">{n_om_inv:,}</div><div class="saas-card-sub">controllers</div></div>
+          <div class="saas-card"><div class="saas-card-label">Zyxel</div>
+            <div class="saas-card-value c-purple">{n_zy_inv:,}</div><div class="saas-card-sub">sites</div></div>
+        </div>""", unsafe_allow_html=True)
+
+        # Pesquisa e filtros
+        with st.expander("⚙️ Filtros e Pesquisa", expanded=True):
+            pesq_col, f1_inv, f2_inv, f3_inv = st.columns([2, 1, 1, 1])
+
+            pesq = pesq_col.text_input(
+                "🔎 Pesquisar INEP ou nome da escola:",
+                placeholder="Ex: 23000066 ou ACARAÚ",
+                key="inv_pesq"
+            )
+            op_plat_inv = sorted(df_inv["Plataforma"].dropna().unique().tolist())
+            op_st_inv   = sorted(df_inv["Status Rede"].dropna().unique().tolist())
+            op_isp_inv  = sorted([v for v in df_inv["ISP"].dropna().unique().tolist() if v not in ("—","")])
+
+            fp_inv  = f1_inv.multiselect("Plataforma", op_plat_inv, default=[], key="fp_inv")
+            fs_inv  = f2_inv.multiselect("Status",     op_st_inv,   default=[], key="fs_inv")
+            fi_inv  = f3_inv.multiselect("ISP",        op_isp_inv,  default=[], key="fi_inv")
+
+        df_inv_f = df_inv.copy()
+
+        # Pesquisa textual em INEP e Nome
+        if pesq.strip():
+            mask = (
+                df_inv_f["INEP"].astype(str).str.contains(pesq.strip(), case=False, na=False) |
+                df_inv_f["Nome no Console"].astype(str).str.contains(pesq.strip(), case=False, na=False)
+            )
+            df_inv_f = df_inv_f[mask]
+
+        if fp_inv: df_inv_f = df_inv_f[df_inv_f["Plataforma"].isin(fp_inv)]
+        if fs_inv: df_inv_f = df_inv_f[df_inv_f["Status Rede"].isin(fs_inv)]
+        if fi_inv: df_inv_f = df_inv_f[df_inv_f["ISP"].isin(fi_inv)]
+
+        st.dataframe(
+            df_inv_f.style.map(cor_status, subset=["Status Rede"]),
+            use_container_width=True,
+            height=520
+        )
+        st.caption(f"{len(df_inv_f):,} de {len(df_inv):,} escolas exibidas")
+
+        ce1, ce2, _ = st.columns([1, 1, 3])
+        ce1.download_button(
+            "⬇️ Exportar filtrado",
+            to_xlsx(df_inv_f),
+            f"inventario_filtrado_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        ce2.download_button(
+            "⬇️ Exportar completo",
+            to_xlsx(df_inv),
+            f"inventario_completo_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.info("Clique em **Coletar Inventário Completo** para carregar todas as escolas.")
+
+# ─────────────────────────────────────────
+# ABA 4 — PROVEDORES
+# ─────────────────────────────────────────
+with t4:
     st.markdown("### Cadastro de Provedores (ISPs)")
     st.write(
         "ISPs detectados via API Ubiquiti são adicionados automaticamente a cada importação. "
         "Edite telefone, celular e observações conforme necessário. "
         "Dados existentes nunca são sobrescritos numa nova importação."
     )
-
     st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
 
     col_sync, col_info = st.columns([2, 4])
@@ -851,8 +1050,7 @@ with t3:
             else:
                 with st.spinner(f"Varrendo {len(validas_sync)} conta(s)..."):
                     isps_api, erros_api = coletar_todos_isps_ubiquiti(validas_sync)
-                for e in erros_api:
-                    st.warning(f"Erro: {e}")
+                for e in erros_api: st.warning(f"Erro: {e}")
                 novos = mesclar_isps_novos(isps_api)
                 if novos > 0:
                     st.success(f"{novos} novo(s) ISP(s) adicionado(s). Total na API: {len(isps_api)}.")
@@ -861,31 +1059,18 @@ with t3:
                 st.session_state.provedores = carregar_provedores()
                 st.rerun()
     with col_info:
-        st.caption(
-            "Varre todos os hosts de todas as contas Ubiquiti cadastradas e coleta os ISPs. "
-            "ISPs já existentes não são alterados."
-        )
+        st.caption("Varre todos os hosts de todas as contas Ubiquiti e coleta os ISPs. ISPs existentes não são alterados.")
 
     st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
 
     lista_prov = [
-        {
-            "Provedor":   isp,
-            "Telefone":   d.get("telefone", ""),
-            "Celular":    d.get("celular", ""),
-            "Observação": d.get("observacao", ""),
-        }
+        {"Provedor": isp, "Telefone": d.get("telefone",""), "Celular": d.get("celular",""), "Observação": d.get("observacao","")}
         for isp, d in st.session_state.provedores.items()
     ]
-    df_prov = pd.DataFrame(lista_prov) if lista_prov else pd.DataFrame(
-        columns=["Provedor", "Telefone", "Celular", "Observação"]
-    )
+    df_prov = pd.DataFrame(lista_prov) if lista_prov else pd.DataFrame(columns=["Provedor","Telefone","Celular","Observação"])
 
     edited_df = st.data_editor(
-        df_prov,
-        num_rows="dynamic",
-        use_container_width=True,
-        key="editor_provedores",
+        df_prov, num_rows="dynamic", use_container_width=True, key="editor_provedores",
         column_config={
             "Provedor":   st.column_config.TextColumn("Provedor (Nome Exato)", required=True),
             "Telefone":   st.column_config.TextColumn("Telefone Fixo"),
@@ -897,12 +1082,12 @@ with t3:
     if st.button("💾 Salvar Alterações", type="primary"):
         novo_dict = {}
         for _, row in edited_df.iterrows():
-            nome_prov = str(row.get("Provedor", "")).strip()
-            if nome_prov and nome_prov.lower() not in ("nan", ""):
+            nome_prov = str(row.get("Provedor","")).strip()
+            if nome_prov and nome_prov.lower() not in ("nan",""):
                 novo_dict[nome_prov] = {
-                    "telefone":   str(row.get("Telefone",   "")).replace("nan", "").strip(),
-                    "celular":    str(row.get("Celular",    "")).replace("nan", "").strip(),
-                    "observacao": str(row.get("Observação", "")).replace("nan", "").strip(),
+                    "telefone":   str(row.get("Telefone",  "")).replace("nan","").strip(),
+                    "celular":    str(row.get("Celular",   "")).replace("nan","").strip(),
+                    "observacao": str(row.get("Observação","")).replace("nan","").strip(),
                 }
         st.session_state.provedores = novo_dict
         ok = salvar_provedores(novo_dict)
@@ -912,9 +1097,9 @@ with t3:
         st.rerun()
 
 # ─────────────────────────────────────────
-# ABA 4 — BUSCA MANUAL
+# ABA 5 — BUSCA MANUAL
 # ─────────────────────────────────────────
-with t4:
+with t5:
     st.markdown("#### INEPs para consulta")
     col_txt, col_how = st.columns([2, 1])
     with col_txt:
@@ -943,7 +1128,6 @@ with t4:
             df_bm_om = pd.read_excel(bm_omada)
             bm_omada.seek(0)
             st.caption(f"{len(df_bm_om)} controllers carregados")
-
     with col_zy_bm:
         st.caption("🟣 **Zyxel** — export CSV do Nebula (Overview → Sites)")
         bm_zyxel = st.file_uploader("Export Zyxel (.csv)", type=["csv"], key="bm_zyxel")
@@ -962,11 +1146,9 @@ with t4:
         if not txt.strip():
             st.warning("Insira ao menos um INEP.")
         else:
-            ineps_m = {i.strip() for i in txt.replace("\n", ",").split(",") if i.strip()}
-            res_bm  = {}
-            erros   = []
+            ineps_m = {i.strip() for i in txt.replace("\n",",").split(",") if i.strip()}
+            res_bm, erros = {}, []
 
-            # ── Ubiquiti ──
             if alvo:
                 with st.spinner(f"Consultando Ubiquiti ({len(alvo)} conta(s))..."):
                     for c in alvo:
@@ -975,7 +1157,6 @@ with t4:
                         except Exception as e:
                             erros.append(f"Ubiquiti {c['apelido']}: {e}")
 
-            # ── Omada ──
             if bm_omada:
                 try:
                     bm_omada.seek(0)
@@ -986,7 +1167,6 @@ with t4:
                 except Exception as e:
                     erros.append(f"Omada: {e}")
 
-            # ── Zyxel ──
             if bm_zyxel:
                 try:
                     bm_zyxel.seek(0)
@@ -997,42 +1177,30 @@ with t4:
                 except Exception as e:
                     erros.append(f"Zyxel: {e}")
 
-            for e in erros:
-                st.error(e)
+            for e in erros: st.error(e)
 
             if res_bm:
                 dfm = pd.DataFrame.from_dict(res_bm, orient="index").reset_index()
                 dfm.rename(columns={"index": "INEP"}, inplace=True)
-
-                # Cards resumo
                 col_c1, col_c2, col_c3, col_c4 = st.columns(4)
-                col_c1.metric("Encontrados",  len(dfm))
+                col_c1.metric("Encontrados",     len(dfm))
                 col_c2.metric("Online",  dfm["Status Rede"].str.contains("ONLINE",  na=False).sum())
                 col_c3.metric("Offline", dfm["Status Rede"].str.contains("OFFLINE", na=False).sum())
                 col_c4.metric("Não encontrados", len(ineps_m) - len(res_bm))
-
-                st.dataframe(
-                    dfm.style.map(cor_status, subset=["Status Rede"]),
-                    use_container_width=True
-                )
-
+                st.dataframe(dfm.style.map(cor_status, subset=["Status Rede"]), use_container_width=True)
                 nao = ineps_m - set(res_bm.keys())
                 if nao:
-                    st.warning(f"{len(nao)} não encontrado(s) em nenhuma plataforma: `{', '.join(sorted(nao))}`")
-
-                st.download_button(
-                    "⬇️ Exportar resultado",
-                    to_xlsx(dfm),
+                    st.warning(f"{len(nao)} não encontrado(s): `{', '.join(sorted(nao))}`")
+                st.download_button("⬇️ Exportar resultado", to_xlsx(dfm),
                     f"busca_manual_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             else:
                 st.error("Nenhum INEP localizado em nenhuma das fontes consultadas.")
 
 # ─────────────────────────────────────────
-# ABA 5 — RAIO-X
+# ABA 6 — RAIO-X
 # ─────────────────────────────────────────
-with t5:
+with t6:
     if not alvo:
         st.warning("Selecione pelo menos uma conta na barra lateral.")
     else:
@@ -1047,19 +1215,16 @@ with t5:
                 with st.spinner(f"Carregando hosts de '{conta_rx}'..."):
                     try:
                         hosts = get_paginated_hosts(key_rx)
-                        rows  = [{"Nome":   extrair_host(h)["nome"],
-                                  "Estado": extrair_host(h)["estado"],
-                                  "IP":     extrair_host(h)["ip"],
-                                  "ISP":    extrair_host(h)["isp"],
-                                  "Uptime": extrair_host(h)["uptime"]}
-                                 for h in hosts]
+                        rows  = [{"Nome": extrair_host(h)["nome"], "Estado": extrair_host(h)["estado"],
+                                  "IP": extrair_host(h)["ip"], "ISP": extrair_host(h)["isp"],
+                                  "Uptime": extrair_host(h)["uptime"]} for h in hosts]
                         df_rx = pd.DataFrame(rows)
                         if filtro:
                             df_rx = df_rx[df_rx["Nome"].str.upper().str.contains(filtro.upper(), na=False)]
                         m1, m2, m3 = st.columns(3)
-                        m1.metric("Total hosts",  len(df_rx))
-                        m2.metric("Conectados",   (df_rx["Estado"] == "connected").sum())
-                        m3.metric("Offline",      (df_rx["Estado"] == "disconnected").sum())
+                        m1.metric("Total hosts", len(df_rx))
+                        m2.metric("Conectados",  (df_rx["Estado"] == "connected").sum())
+                        m3.metric("Offline",     (df_rx["Estado"] == "disconnected").sum())
                         st.dataframe(df_rx.style.map(cor_estado, subset=["Estado"]),
                                      use_container_width=True, height=440)
                         st.download_button("⬇️ Exportar", to_xlsx(df_rx),
@@ -1071,9 +1236,9 @@ with t5:
                 st.info("Selecione uma conta e clique em 'Sondar'.")
 
 # ─────────────────────────────────────────
-# ABA 6 — DIAGNÓSTICO
+# ABA 7 — DIAGNÓSTICO
 # ─────────────────────────────────────────
-with t6:
+with t7:
     if not alvo:
         st.warning("Selecione pelo menos uma conta na barra lateral.")
     else:
@@ -1103,41 +1268,34 @@ with t6:
             st.rerun()
 
 # ─────────────────────────────────────────
-# ABA 7 — AJUDA
+# ABA 8 — AJUDA
 # ─────────────────────────────────────────
-with t7:
+with t8:
     st.markdown("### Como usar o Hub Redes — EACE")
     st.markdown("""
-**Fluxo principal:**
-1. Configure as contas Ubiquiti na barra lateral (apelido + chave API)
-2. Faça upload da **planilha de chamados** (.xlsx com coluna INEP)
-3. Opcionalmente, faça upload dos exports do **Omada** e/ou **Zyxel**
+**Fluxo principal (chamados):**
+1. Configure as contas Ubiquiti na barra lateral
+2. Faça upload da planilha de chamados (.xlsx com coluna INEP)
+3. Opcionalmente, faça upload dos exports do Omada e/ou Zyxel
 4. Clique em **Iniciar Consulta em Massa**
 5. Acesse **Chamados** para filtrar e exportar
 
+**Inventário Geral:**
+- Coleta TODAS as escolas de todas as plataformas, sem depender de chamados
+- Ubiquiti: buscado automaticamente via API (todas as contas ativas)
+- Omada e Zyxel: faça upload dos exports na aba Inventário
+- Campo de pesquisa por INEP ou nome da escola
+- Exportação filtrada ou completa em .xlsx
+
 **Como exportar o Zyxel:**
-No portal Zyxel Nebula → Overview → aba Sites → ícone de download (CSV) no canto superior direito.
-O arquivo será algo como `2026-04-04_Overviews_Sites.csv`.
+Zyxel Nebula → Overview → aba Sites → ícone de download (CSV) no canto superior direito.
 
 **Como exportar o Omada:**
-No portal `use1-omada-cloud.tplinkcloud.com` → On Premise Systems → botão **Export** no canto superior direito.
+`use1-omada-cloud.tplinkcloud.com` → On Premise Systems → botão **Export**.
 
-**Legenda de cores — Status Rede:**
-- 🟢 `UBIQUITI - ONLINE` — online via Ubiquiti
-- 🔴 `UBIQUITI - OFFLINE` — offline via Ubiquiti
-- 🔵 `OMADA - ONLINE` — online via Omada
-- 🟠 `OMADA - OFFLINE` — offline via Omada
-- 🟣 `ZYXEL - ONLINE` — online via Zyxel Nebula (status OK)
-- 🩷 `ZYXEL - OFFLINE` — offline via Zyxel (Device offline / Devices unreachable)
-- 🟡 `ZYXEL - ALERTA` — dispositivo com alertas (Device alerted)
-- ⚫ `ZYXEL - SEM DISPOSITIVO` — site sem devices cadastrados
-- ⬛ `NÃO ENCONTRADO` — INEP não localizado em nenhuma plataforma
-
-**Filtro de Plataforma:**
-Use o filtro **Plataforma** na aba Chamados para isolar por origem.
-Chamados "Sem Analista" identificados como Omada ou Zyxel aparecem aqui.
-
-**Prioridade de cruzamento:**
-Se o mesmo INEP aparecer em múltiplas plataformas, a ordem de prioridade é:
-Ubiquiti → Omada → Zyxel (o primeiro que encontrar prevalece).
+**Legenda de cores:**
+- 🟢 UBIQUITI - ONLINE / 🔴 UBIQUITI - OFFLINE
+- 🔵 OMADA - ONLINE / 🟠 OMADA - OFFLINE
+- 🟣 ZYXEL - ONLINE / 🩷 ZYXEL - OFFLINE / 🟡 ZYXEL - ALERTA
+- ⬛ NÃO ENCONTRADO
     """)
