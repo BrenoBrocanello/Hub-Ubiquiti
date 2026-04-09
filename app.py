@@ -167,22 +167,40 @@ def salvar_contas(contas):
 
 def carregar_contas():
     """
-    Lê as contas exclusivamente dos Streamlit Secrets.
-    Formato esperado em secrets.toml:
+    Lê as contas dos Streamlit Secrets.
+    Tenta três formatos diferentes para máxima compatibilidade:
+
+    Formato 1 — seção [contas] (recomendado):
         [contas]
-        Conta_AC1  = "chave1"
-        Conta_AM1  = "chave2"
+        Conta_AC1 = "chave1"
+
+    Formato 2 — lista JSON na chave contas_json:
+        contas_json = '[{"apelido":"Conta AC1","api_key":"chave1"}]'
+
+    Fallback — arquivo config_contas.json local (desenvolvimento).
     """
+    # Formato 1: seção [contas]
     try:
-        contas_secrets = st.secrets.get("contas", {})
-        if contas_secrets:
-            return [
-                {"apelido": apelido, "api_key": api_key}
-                for apelido, api_key in contas_secrets.items()
+        if "contas" in st.secrets:
+            sec = st.secrets["contas"]
+            resultado = [
+                {"apelido": str(k), "api_key": str(v)}
+                for k, v in sec.items()
+                if str(v).strip()
             ]
+            if resultado:
+                return resultado
     except Exception:
         pass
-    # Fallback local para desenvolvimento (arquivo ignorado pelo git)
+
+    # Formato 2: JSON na chave contas_json
+    try:
+        if "contas_json" in st.secrets:
+            return json.loads(st.secrets["contas_json"])
+    except Exception:
+        pass
+
+    # Fallback local para desenvolvimento
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -607,6 +625,23 @@ with st.sidebar:
     else:
         st.warning("Nenhuma conta configurada nos Secrets.")
         alvo = []
+
+        # Diagnóstico — ajuda a identificar problema de formato
+        with st.expander("🔍 Diagnóstico Secrets", expanded=True):
+            try:
+                chaves_disponiveis = list(st.secrets.keys())
+                st.caption(f"Chaves encontradas nos Secrets: `{chaves_disponiveis}`")
+                if "contas" in st.secrets:
+                    itens = dict(st.secrets["contas"])
+                    st.caption(f"Entradas em [contas]: {len(itens)}")
+                    for k, v in list(itens.items())[:3]:
+                        st.caption(f"  • {k}: {'✅ preenchida' if str(v).strip() else '❌ vazia'}")
+                else:
+                    st.caption("❌ Seção [contas] não encontrada nos Secrets.")
+                    st.caption("Verifique se o formato está correto:")
+                    st.code("[contas]\nConta_AC1 = \"sua_chave\"", language="toml")
+            except Exception as ex:
+                st.caption(f"Erro ao ler Secrets: {ex}")
 
     st.markdown('<div class="sidebar-label">Status</div>', unsafe_allow_html=True)
     ca, cb = st.columns(2)

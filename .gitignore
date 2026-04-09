@@ -1,4 +1,5 @@
-Secrets.toml
+secrets.toml
+.streamlit/secrets.toml
 config_provedores.json
 __pycache__/
 *.xlsx
