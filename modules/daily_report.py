@@ -34,7 +34,7 @@ COLUMN_ALIASES = {
         "dias abertos", "dias abertos corridos", "dias abertos (corridos)",
     ],
     "opened_at": [
-        "aberto em", "data de abertura", "data abertura", "dt abertura",
+        "aberto em", "aberto no dia", "aberto dia", "data de abertura", "data abertura", "dt abertura",
         "data/hora abertura", "data hora abertura", "abertura", "abertura do chamado",
         "criado em", "criado", "data de criacao", "data de criação",
         "dt criacao", "dt criação", "created at", "created", "opened at", "opened",
@@ -301,7 +301,7 @@ def build_daily_closing(
     attention_points: str,
     next_actions: str,
 ) -> tuple[dict | None, str | None]:
-    df, _, _, error = read_daily_sheet(uploaded_file)
+    df, column_map, _, error = read_daily_sheet(uploaded_file)
     if error:
         return None, error
 
@@ -338,6 +338,7 @@ def build_daily_closing(
         "provider_summary": _records(provider_summary),
         "uf_summary": _records(uf_summary),
         "opened_today_rows": _records(opened_today),
+        "has_opening_date_column": "opened_at" in column_map,
         "full_rows": _records(df),
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -857,7 +858,10 @@ def render_daily_report(closing: dict | None) -> None:
     st.markdown("#### 7. Chamados Abertos Hoje")
     opened_df = pd.DataFrame(closing.get("opened_today_rows", []))
     if opened_df.empty:
-        st.info("Nenhum chamado aberto na data do relatório, ou a planilha não contem coluna de data de abertura.")
+        if closing.get("has_opening_date_column"):
+            st.info("A coluna de abertura foi encontrada, mas nenhum chamado tem data igual à data do relatório.")
+        else:
+            st.info("A planilha não contém uma coluna de data de abertura reconhecida.")
     else:
         columns = [c for c in ["Ticket/OS", "INEP", "Escola", "UF", "Provedor", "Data de abertura"] if c in opened_df.columns]
         st.dataframe(opened_df[columns], use_container_width=True, hide_index=True)
