@@ -33,7 +33,12 @@ COLUMN_ALIASES = {
         "dias", "dias em aberto", "dias aberto", "tempo em aberto",
         "dias abertos", "dias abertos corridos", "dias abertos (corridos)",
     ],
-    "opened_at": ["aberto em", "data de abertura", "criado em", "abertura"],
+    "opened_at": [
+        "aberto em", "data de abertura", "data abertura", "dt abertura",
+        "data/hora abertura", "data hora abertura", "abertura", "abertura do chamado",
+        "criado em", "criado", "data de criacao", "data de criação",
+        "dt criacao", "dt criação", "created at", "created", "opened at", "opened",
+    ],
     "analyst": ["analista", "responsavel", "responsável", "atribuido a", "atribuído a"],
 }
 
@@ -87,6 +92,11 @@ def find_column_map(columns: list[str]) -> tuple[dict[str, str], list[str]]:
             if key in normalized_columns:
                 found[field] = normalized_columns[key]
                 break
+        if field not in found:
+            for normalized_col, original_col in normalized_columns.items():
+                if any(_normalize_text(alias) in normalized_col for alias in aliases):
+                    found[field] = original_col
+                    break
     missing = [label for field, label in REQUIRED_FIELDS.items() if field not in found]
     return found, missing
 
@@ -98,6 +108,45 @@ def _to_number(series: pd.Series) -> pd.Series:
         .str.extract(r"(-?\d+(?:\.\d+)?)", expand=False)
     )
     return pd.to_numeric(cleaned, errors="coerce").fillna(0).astype(int)
+
+
+def _parse_date_series(series: pd.Series) -> pd.Series:
+    raw = series.astype(str).str.strip()
+    iso_mask = raw.str.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}")
+
+    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    if iso_mask.any():
+        parsed.loc[iso_mask] = pd.to_datetime(series[iso_mask], errors="coerce")
+    if (~iso_mask).any():
+        parsed.loc[~iso_mask] = pd.to_datetime(series[~iso_mask], errors="coerce", dayfirst=True)
+
+    missing = parsed.isna()
+
+    if missing.any():
+        parsed_without_dayfirst = pd.to_datetime(series[missing], errors="coerce")
+        parsed.loc[missing] = parsed_without_dayfirst
+        missing = parsed.isna()
+
+    if missing.any():
+        numeric = pd.to_numeric(series[missing], errors="coerce")
+        numeric_dates = pd.to_datetime(
+            numeric,
+            errors="coerce",
+            unit="D",
+            origin="1899-12-30",
+        )
+        parsed.loc[missing] = numeric_dates
+
+    return parsed.dt.date
+
+
+def _coerce_date(value: Any) -> date | None:
+    if isinstance(value, date):
+        return value
+    parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
+    if pd.isna(parsed):
+        return None
+    return parsed.date()
 
 
 def _records(df: pd.DataFrame) -> list[dict]:
@@ -152,10 +201,10 @@ def normalize_daily_dataframe(df: pd.DataFrame, column_map: dict[str, str]) -> p
     result["Provedor"] = result["Provedor"].astype(str).str.strip()
     result["Dias em aberto"] = _to_number(result["Dias em aberto"])
 
-    if "Data de abertura" in result.columns:
-        result["Data de abertura"] = pd.to_datetime(
-            result["Data de abertura"], errors="coerce", dayfirst=True
-        ).dt.date
+    if "opened_at" in column_map:
+        result["Data de abertura"] = _parse_date_series(result["Data de abertura"])
+    elif "Data de abertura" in result.columns:
+        result["Data de abertura"] = pd.NaT
 
     extra_cols = [c for c in df.columns if c not in set(column_map.values())]
     for col in extra_cols:
@@ -167,7 +216,11 @@ def normalize_daily_dataframe(df: pd.DataFrame, column_map: dict[str, str]) -> p
 def _opened_today(df: pd.DataFrame, report_date: date) -> pd.DataFrame:
     if "Data de abertura" not in df.columns:
         return pd.DataFrame()
-    return df[df["Data de abertura"] == report_date].copy()
+    target_date = _coerce_date(report_date)
+    if target_date is None:
+        target_date = date.today()
+    opened_dates = _parse_date_series(df["Data de abertura"])
+    return df[opened_dates == target_date].copy()
 
 
 def _provider_summary(df: pd.DataFrame) -> pd.DataFrame:
@@ -356,17 +409,35 @@ def _pdf_paragraph(text: Any, style):
 
 def _pdf_table(data: list[list[Any]], widths=None, header=True):
     from reportlab.lib import colors
+    from reportlab.lib.styles import ParagraphStyle
     from reportlab.platypus import Table, TableStyle
 
-    table = Table(data, colWidths=widths, repeatRows=1 if header else 0, hAlign="LEFT")
+    cell_style = ParagraphStyle(
+        "HubTableCell",
+        fontName="Helvetica",
+        fontSize=7.2,
+        leading=9,
+        textColor=colors.HexColor("#111827"),
+        wordWrap="CJK",
+    )
+    header_style = ParagraphStyle(
+        "HubTableHeader",
+        parent=cell_style,
+        fontName="Helvetica-Bold",
+        textColor=colors.white,
+    )
+    wrapped_data = []
+    for row_idx, row in enumerate(data):
+        style = header_style if header and row_idx == 0 else cell_style
+        wrapped_data.append([_pdf_paragraph(str(value), style) for value in row])
+
+    table = Table(wrapped_data, colWidths=widths, repeatRows=1 if header else 0, hAlign="LEFT")
     style = [
         ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ("LEADING", (0, 0), (-1, -1), 10),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D7DEE9")),
-        ("LEFTPADDING", (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
         ("TOPPADDING", (0, 0), (-1, -1), 4),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
     ]
@@ -417,6 +488,12 @@ def _pdf_bullets(items: list[str], empty_message: str, styles):
             leftIndent=18,
         )
     ]
+
+
+def _truncate_table_value(value: Any, limit: int = 70) -> str:
+    text = str(value if value is not None else "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[: limit - 3] + "..." if len(text) > limit else text
 
 
 def generate_daily_report_pdf(closing: dict) -> bytes:
@@ -535,48 +612,60 @@ def generate_daily_report_pdf(closing: dict) -> bytes:
     story.append(Spacer(1, 6))
     critical_df = pd.DataFrame(closing.get("critical_rows", []))
     if critical_df.empty:
-        story.append(Paragraph("Não há chamados críticos para exibir.", styles["Body"]))
+        story.append(Paragraph("Não há chamados criticos para exibir.", styles["Body"]))
     else:
-        cols = [c for c in ["Ticket/OS", "INEP", "Escola", "UF", "Provedor", "Dias em aberto", "Analista"] if c in critical_df.columns]
+        cols = [c for c in ["Ticket/OS", "INEP", "Escola", "UF", "Provedor", "Dias em aberto"] if c in critical_df.columns]
         critical_df = critical_df[cols].head(15).astype(str)
-        rows = [cols] + critical_df.map(lambda x: x[:42] + "..." if len(x) > 45 else x).values.tolist()
-        story.append(_pdf_table(rows, widths=[2.4 * cm, 2.2 * cm, 4.3 * cm, 1.2 * cm, 3.5 * cm, 2.0 * cm, 2.4 * cm]))
+        rows = [cols] + critical_df.map(lambda x: _truncate_table_value(x, 58)).values.tolist()
+        story.append(_pdf_table(rows, widths=[2.7 * cm, 2.2 * cm, 6.0 * cm, 1.1 * cm, 4.0 * cm, 2.2 * cm]))
     story.append(Spacer(1, 10))
 
     story.append(_pdf_section("4. Chamados por Provedor", styles))
     story.append(Spacer(1, 6))
     provider_df = pd.DataFrame(closing.get("provider_summary", []))
     if provider_df.empty:
-        story.append(Paragraph("Não há dados por provedor.", styles["Body"]))
+        story.append(Paragraph("não h? dados por provedor.", styles["Body"]))
     else:
         cols = provider_df.columns.tolist()
-        rows = [cols] + provider_df.head(20).astype(str).values.tolist()
-        story.append(_pdf_table(rows, widths=[7.2 * cm, 3.0 * cm, 4.0 * cm, 3.2 * cm]))
+        rows = [cols] + provider_df.head(20).astype(str).map(lambda x: _truncate_table_value(x, 52)).values.tolist()
+        story.append(_pdf_table(rows, widths=[7.2 * cm, 2.8 * cm, 4.0 * cm, 3.4 * cm]))
     story.append(Spacer(1, 10))
 
-    story.append(_pdf_section("5. Distribuição por Estado", styles))
+    story.append(_pdf_section("5. Distribuicão por Estado", styles))
     story.append(Spacer(1, 6))
     uf_df = pd.DataFrame(closing.get("uf_summary", []))
     if uf_df.empty:
-        story.append(Paragraph("Não há dados por UF.", styles["Body"]))
+        story.append(Paragraph("não h? dados por UF.", styles["Body"]))
     else:
         rows = [uf_df.columns.tolist()] + uf_df.astype(str).values.tolist()
         story.append(_pdf_table(rows, widths=[5.0 * cm, 5.5 * cm, 5.5 * cm]))
     story.append(Spacer(1, 10))
 
-    story.append(_pdf_section("6. Pontos de Atenção", styles))
+    story.append(_pdf_section("6. Todos os Chamados de Rede Externa", styles))
+    story.append(Spacer(1, 6))
+    full_df = pd.DataFrame(closing.get("full_rows", []))
+    if full_df.empty:
+        story.append(Paragraph("não h? listagem completa dispon?vel para este fechamento.", styles["Body"]))
+    else:
+        cols = [c for c in ["Ticket/OS", "Provedor", "Dias em aberto", "INEP", "Escola"] if c in full_df.columns]
+        full_df = full_df[cols].astype(str)
+        rows = [cols] + full_df.map(lambda x: _truncate_table_value(x, 68)).values.tolist()
+        story.append(_pdf_table(rows, widths=[2.8 * cm, 4.3 * cm, 2.4 * cm, 2.3 * cm, 6.6 * cm]))
+    story.append(Spacer(1, 10))
+
+    story.append(_pdf_section("7. Pontos de Atenção", styles))
     story.append(Spacer(1, 6))
     story.extend(_pdf_bullets(
         closing.get("alerts", []) + closing.get("manual_attention_items", []),
-        "Não há pontos de atenção adicionais registrados.",
+        "Não há pontos de Atenção adicionais registrados.",
         styles,
     ))
 
-    story.append(_pdf_section("7. Observações Operacionais", styles))
+    story.append(_pdf_section("8. Observações Operacionais", styles))
     story.append(Spacer(1, 6))
-    story.append(Paragraph(closing.get("observations") or "Não foram registradas observações operacionais adicionais.", styles["Body"]))
+    story.append(Paragraph(closing.get("observations") or "não foram registradas Observações operacionais adicionais.", styles["Body"]))
 
-    story.append(_pdf_section("8. Próximas Ações", styles))
+    story.append(_pdf_section("9. Proximas atividades", styles))
     story.append(Spacer(1, 6))
     story.append(Paragraph(closing.get("next_actions") or "Manter acompanhamento dos chamados críticos e pendências com as provedoras.", styles["Body"]))
 
@@ -743,7 +832,7 @@ def render_daily_report(closing: dict | None) -> None:
     st.markdown("#### 3. Indicadores Gerais")
     st.dataframe(_indicators_dataframe(indicators), use_container_width=True, hide_index=True)
 
-    st.markdown("#### 4. Chamados Mais Críticos")
+    st.markdown("#### 4. Chamados Mais Criticos")
     critical_df = pd.DataFrame(closing.get("critical_rows", []))
     if critical_df.empty:
         st.info("Não há chamados críticos para exibir.")
@@ -754,36 +843,29 @@ def render_daily_report(closing: dict | None) -> None:
     st.markdown("#### 5. Chamados por Provedor")
     provider_df = pd.DataFrame(closing.get("provider_summary", []))
     if provider_df.empty:
-        st.info("Não há dados por provedor.")
+        st.info("não h? dados por provedor.")
     else:
         st.dataframe(provider_df, use_container_width=True, hide_index=True)
 
     st.markdown("#### 6. Distribuição por Estado")
     uf_df = pd.DataFrame(closing.get("uf_summary", []))
     if uf_df.empty:
-        st.info("Não há dados por UF.")
+        st.info("não h? dados por UF.")
     else:
         st.dataframe(uf_df, use_container_width=True, hide_index=True)
 
     st.markdown("#### 7. Chamados Abertos Hoje")
     opened_df = pd.DataFrame(closing.get("opened_today_rows", []))
     if opened_df.empty:
-        st.info("Nenhum chamado aberto na data do relatório, ou a planilha não contém coluna de data de abertura.")
+        st.info("Nenhum chamado aberto na data do relatório, ou a planilha não contem coluna de data de abertura.")
     else:
         columns = [c for c in ["Ticket/OS", "INEP", "Escola", "UF", "Provedor", "Data de abertura"] if c in opened_df.columns]
         st.dataframe(opened_df[columns], use_container_width=True, hide_index=True)
 
-    st.markdown("#### 8. Pontos de Atenção")
-    all_alerts = closing.get("alerts", []) + closing.get("manual_attention_items", [])
-    _render_item_list(all_alerts, "Não há pontos de atenção adicionais registrados.")
-
-    st.markdown("#### 9. Observações Operacionais")
-    st.write(closing.get("observations") or "Não foram registradas observações operacionais adicionais.")
-
-    st.markdown("#### 10. Listagem Completa")
+    st.markdown("#### 8. Todos os Chamados de Rede Externa")
     full_df = pd.DataFrame(closing.get("full_rows", []))
     if full_df.empty:
-        st.info("A listagem completa não está disponível para este fechamento.")
+        st.info("A listagem completa não est? dispon?vel para este fechamento.")
     else:
         col_search, col_uf, col_provider = st.columns([2, 1, 1])
         query = col_search.text_input("Pesquisar Ticket, INEP ou Escola", key="daily_full_search")
@@ -804,7 +886,18 @@ def render_daily_report(closing: dict | None) -> None:
             filtered = filtered[filtered["UF"].isin(uf_filter)]
         if provider_filter:
             filtered = filtered[filtered["Provedor"].isin(provider_filter)]
-        st.dataframe(filtered, use_container_width=True, hide_index=True, height=520)
+        display_cols = [c for c in ["Ticket/OS", "Provedor", "Dias em aberto", "INEP", "Escola"] if c in filtered.columns]
+        st.dataframe(filtered[display_cols], use_container_width=True, hide_index=True, height=520)
+
+    st.markdown("#### 9. Pontos de Atenção")
+    all_alerts = closing.get("alerts", []) + closing.get("manual_attention_items", [])
+    _render_item_list(all_alerts, "não h? pontos de Atenção adicionais registrados.")
+
+    st.markdown("#### 10. Observações Operacionais")
+    st.write(closing.get("observations") or "não foram registradas Observações operacionais adicionais.")
+
+    st.markdown("#### 11. Proximas atividades")
+    st.write(closing.get("next_actions") or "Manter acompanhamento dos chamados críticos e pendências com as provedoras.")
 
     pdf_bytes = generate_daily_report_pdf(closing)
     st.download_button(

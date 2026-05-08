@@ -1,4 +1,4 @@
-import streamlit as st
+﻿import streamlit as st
 import requests
 import pandas as pd
 import json
@@ -842,9 +842,6 @@ with st.sidebar:
     if st.session_state.ultima_consulta:
         st.caption(f"Última consulta: {st.session_state.ultima_consulta}")
 
-    st.markdown('<div class="sidebar-label">Provedores</div>', unsafe_allow_html=True)
-    st.metric("Cadastrados", len(st.session_state.provedores))
-
 # ═══════════════════════════════════════════════════════════════
 # HEADER
 # ═══════════════════════════════════════════════════════════════
@@ -858,10 +855,9 @@ st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
 # ═══════════════════════════════════════════════════════════════
 # ABAS
 # ═══════════════════════════════════════════════════════════════
-t1, t2, t3, t4, t5, t6, t7 = st.tabs([
+t1, t2, t3, t4, t5, t6 = st.tabs([
     "📄 Relatório Diário",
     "🌐 Inventário Geral",
-    "🏢 Provedores",
     "🔍 Busca Manual",
     "🛠️ Raio-X da Conta",
     "🩺 Diagnóstico",
@@ -1077,76 +1073,9 @@ with t2:
         st.info("Clique em **Coletar Inventário Completo** para carregar todas as escolas.")
 
 # ─────────────────────────────────────────
-# ABA 3 — PROVEDORES
+# ABA 3 — BUSCA MANUAL
 # ─────────────────────────────────────────
 with t3:
-    st.markdown("### Cadastro de Provedores (ISPs)")
-    st.write(
-        "ISPs detectados via API Ubiquiti são adicionados automaticamente a cada importação. "
-        "Edite telefone, celular e observações conforme necessário. "
-        "Dados existentes nunca são sobrescritos numa nova importação."
-    )
-    st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
-
-    col_sync, col_info = st.columns([2, 4])
-    with col_sync:
-        if st.button("🔄 Buscar ISPs via API Ubiquiti", type="primary", use_container_width=True):
-            validas_sync = [c for c in st.session_state.contas if c["api_key"].strip()]
-            if not validas_sync:
-                st.error("Nenhuma conta Ubiquiti configurada.")
-            else:
-                with st.spinner(f"Varrendo {len(validas_sync)} conta(s)..."):
-                    isps_api, erros_api = coletar_todos_isps_ubiquiti(validas_sync)
-                for e in erros_api: st.warning(f"Erro: {e}")
-                novos = mesclar_isps_novos(isps_api)
-                if novos > 0:
-                    st.success(f"{novos} novo(s) ISP(s) adicionado(s). Total na API: {len(isps_api)}.")
-                else:
-                    st.info(f"{len(isps_api)} ISP(s) encontrado(s) — nenhum novo.")
-                st.session_state.provedores = carregar_provedores()
-                st.rerun()
-    with col_info:
-        st.caption("Varre todos os hosts de todas as contas Ubiquiti e coleta os ISPs. ISPs existentes não são alterados.")
-
-    st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
-
-    lista_prov = [
-        {"Provedor": isp, "Telefone": d.get("telefone",""), "Celular": d.get("celular",""), "Observação": d.get("observacao","")}
-        for isp, d in st.session_state.provedores.items()
-    ]
-    df_prov = pd.DataFrame(lista_prov) if lista_prov else pd.DataFrame(columns=["Provedor","Telefone","Celular","Observação"])
-
-    edited_df = st.data_editor(
-        df_prov, num_rows="dynamic", use_container_width=True, key="editor_provedores",
-        column_config={
-            "Provedor":   st.column_config.TextColumn("Provedor (Nome Exato)", required=True),
-            "Telefone":   st.column_config.TextColumn("Telefone Fixo"),
-            "Celular":    st.column_config.TextColumn("Celular / WhatsApp"),
-            "Observação": st.column_config.TextColumn("Observação"),
-        }
-    )
-
-    if st.button("💾 Salvar Alterações", type="primary"):
-        novo_dict = {}
-        for _, row in edited_df.iterrows():
-            nome_prov = str(row.get("Provedor","")).strip()
-            if nome_prov and nome_prov.lower() not in ("nan",""):
-                novo_dict[nome_prov] = {
-                    "telefone":   str(row.get("Telefone",  "")).replace("nan","").strip(),
-                    "celular":    str(row.get("Celular",   "")).replace("nan","").strip(),
-                    "observacao": str(row.get("Observação","")).replace("nan","").strip(),
-                }
-        st.session_state.provedores = novo_dict
-        ok = salvar_provedores(novo_dict)
-        if ok:
-            st.session_state.provedores = carregar_provedores()
-            st.success(f"Provedores salvos! ({len(st.session_state.provedores)} registros)")
-        st.rerun()
-
-# ─────────────────────────────────────────
-# ABA 4 — BUSCA MANUAL
-# ─────────────────────────────────────────
-with t4:
     st.markdown("#### INEPs para consulta")
     col_txt, col_how = st.columns([2, 1])
     with col_txt:
@@ -1248,9 +1177,9 @@ with t4:
                 st.error("Nenhum INEP localizado em nenhuma das fontes consultadas.")
 
 # ─────────────────────────────────────────
-# ABA 5 — RAIO-X
+# ABA 4 — RAIO-X
 # ─────────────────────────────────────────
-with t5:
+with t4:
     if not alvo:
         st.warning("Selecione pelo menos uma conta na barra lateral.")
     else:
@@ -1286,9 +1215,9 @@ with t5:
                 st.info("Selecione uma conta e clique em 'Sondar'.")
 
 # ─────────────────────────────────────────
-# ABA 6 — DIAGNÓSTICO
+# ABA 5 — DIAGNÓSTICO
 # ─────────────────────────────────────────
-with t6:
+with t5:
     if not alvo:
         st.warning("Selecione pelo menos uma conta na barra lateral.")
     else:
@@ -1306,21 +1235,10 @@ with t6:
             prev = k[:6] + "•••" + k[-4:] if len(k) > 10 else "⚠️ inválida"
             st.markdown(f"- **{c['apelido']}** — `{prev}`")
 
-        st.markdown("---")
-        st.markdown("**Debug — Provedores:**")
-        col_d1, col_d2 = st.columns(2)
-        col_d1.metric("Na sessão",  len(st.session_state.provedores))
-        col_d2.metric("No arquivo", len(carregar_provedores()))
-        st.caption(f"Arquivo: `{os.path.abspath(CONFIG_PROVEDORES)}` | Existe: `{os.path.exists(CONFIG_PROVEDORES)}`")
-        if st.button("🔄 Recarregar provedores do disco"):
-            st.session_state.provedores = carregar_provedores()
-            st.success(f"Recarregado: {len(st.session_state.provedores)} provedores.")
-            st.rerun()
-
 # ─────────────────────────────────────────
-# ABA 7 — AJUDA
+# ABA 6 — AJUDA
 # ─────────────────────────────────────────
-with t7:
+with t6:
     st.markdown("### Como usar o Hub Redes — EACE")
     st.markdown("""
 **Relatório Diário:**
