@@ -73,13 +73,13 @@ Configure na barra lateral do app e clique em **Salvar**.
 1. Acesse `use1-omada-cloud.tplinkcloud.com`
 2. Vá em **On Premise Systems**
 3. Clique no botão **Export** (canto superior direito)
-4. Faça upload do `.xlsx` gerado na aba **Processar Planilha**
+4. Faça upload do `.xlsx` gerado nas abas que aceitam export Omada, como **Inventário Geral** ou **Busca Manual**
 
 ### Zyxel Nebula (export manual)
 1. Acesse o portal Zyxel Nebula
 2. Vá em **Overview → Sites**
 3. Clique no ícone de download para exportar o CSV
-4. Faça upload do `.csv` gerado na aba **Processar Planilha**
+4. Faça upload do `.csv` gerado nas abas que aceitam export Zyxel, como **Inventário Geral** ou **Busca Manual**
 
 ## Arquivos ignorados pelo git
 

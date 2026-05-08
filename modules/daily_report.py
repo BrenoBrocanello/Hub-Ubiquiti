@@ -1,0 +1,874 @@
+from __future__ import annotations
+
+import re
+import unicodedata
+from datetime import date, datetime
+from typing import Any
+
+import pandas as pd
+import streamlit as st
+
+from modules.daily_report_auth import check_daily_report_password
+from modules.daily_report_storage import (
+    clear_current_daily_closing,
+    delete_daily_closing,
+    list_daily_closings,
+    load_current_daily_closing,
+    save_daily_closing,
+)
+
+
+COLUMN_ALIASES = {
+    "ticket": [
+        "ticket", "ticket#", "os", "ordem de servico", "ordem de serviço",
+        "numero os", "número os", "id chamado", "chamado",
+    ],
+    "inep": ["inep", "codigo inep", "código inep", "cod inep"],
+    "school": ["escola", "nome da escola", "unidade", "unidade escolar"],
+    "uf": ["uf", "estado"],
+    "provider": [
+        "provedor", "fornecedor", "fornecedor de rede externa", "operadora", "isp",
+    ],
+    "days": [
+        "dias", "dias em aberto", "dias aberto", "tempo em aberto",
+        "dias abertos", "dias abertos corridos", "dias abertos (corridos)",
+    ],
+    "opened_at": ["aberto em", "data de abertura", "criado em", "abertura"],
+    "analyst": ["analista", "responsavel", "responsável", "atribuido a", "atribuído a"],
+}
+
+REQUIRED_FIELDS = {
+    "ticket": "Ticket/OS",
+    "uf": "UF/Estado",
+    "provider": "Provedor/Operadora",
+    "days": "Dias em aberto",
+}
+
+DISPLAY_COLUMNS = {
+    "ticket": "Ticket/OS",
+    "inep": "INEP",
+    "school": "Escola",
+    "uf": "UF",
+    "provider": "Provedor",
+    "days": "Dias em aberto",
+    "opened_at": "Data de abertura",
+    "analyst": "Analista",
+}
+
+INDICATOR_LABELS = {
+    "total_open": "Total de chamados em aberto",
+    "over_30": "Chamados acima de 30 dias",
+    "over_60": "Chamados acima de 60 dias",
+    "over_100": "Chamados acima de 100 dias",
+    "affected_providers": "Total de provedores afetados",
+    "opened_today": "Chamados abertos hoje",
+}
+
+
+def _normalize_text(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_multiline_items(text: str) -> list[str]:
+    raw_items = re.split(r"[\n,;]+", str(text or ""))
+    return [item.strip() for item in raw_items if item.strip()]
+
+
+def find_column_map(columns: list[str]) -> tuple[dict[str, str], list[str]]:
+    normalized_columns = {_normalize_text(col): col for col in columns}
+    found = {}
+    for field, aliases in COLUMN_ALIASES.items():
+        for alias in aliases:
+            key = _normalize_text(alias)
+            if key in normalized_columns:
+                found[field] = normalized_columns[key]
+                break
+    missing = [label for field, label in REQUIRED_FIELDS.items() if field not in found]
+    return found, missing
+
+
+def _to_number(series: pd.Series) -> pd.Series:
+    cleaned = (
+        series.astype(str)
+        .str.replace(",", ".", regex=False)
+        .str.extract(r"(-?\d+(?:\.\d+)?)", expand=False)
+    )
+    return pd.to_numeric(cleaned, errors="coerce").fillna(0).astype(int)
+
+
+def _records(df: pd.DataFrame) -> list[dict]:
+    if df is None or df.empty:
+        return []
+    return df.fillna("").to_dict(orient="records")
+
+
+def _indicators_dataframe(indicators: dict) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"Indicador": label, "Quantidade": indicators.get(key, 0)}
+            for key, label in INDICATOR_LABELS.items()
+        ]
+    )
+
+
+def read_daily_sheet(uploaded_file) -> tuple[pd.DataFrame | None, dict[str, str], list[str], str | None]:
+    if uploaded_file is None:
+        return None, {}, [], "Envie uma planilha .xlsx para concluir o fechamento."
+
+    file_name = getattr(uploaded_file, "name", "")
+    if not str(file_name).lower().endswith(".xlsx"):
+        return None, {}, [], "Formato inválido. Envie apenas arquivo .xlsx."
+
+    try:
+        df = pd.read_excel(uploaded_file)
+    except Exception as exc:
+        return None, {}, [], f"Não foi possível ler a planilha: {exc}"
+
+    if df.empty:
+        return None, {}, [], "A planilha enviada está vazia."
+
+    column_map, missing = find_column_map([str(c) for c in df.columns])
+    if missing:
+        return None, column_map, missing, "Colunas obrigatórias não encontradas: " + ", ".join(missing)
+
+    return normalize_daily_dataframe(df, column_map), column_map, [], None
+
+
+def normalize_daily_dataframe(df: pd.DataFrame, column_map: dict[str, str]) -> pd.DataFrame:
+    result = pd.DataFrame()
+    for field, label in DISPLAY_COLUMNS.items():
+        if field in column_map:
+            result[label] = df[column_map[field]]
+        else:
+            result[label] = ""
+
+    result["Ticket/OS"] = result["Ticket/OS"].astype(str).str.strip()
+    result["INEP"] = result["INEP"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+    result["UF"] = result["UF"].astype(str).str.strip().str.upper()
+    result["Provedor"] = result["Provedor"].astype(str).str.strip()
+    result["Dias em aberto"] = _to_number(result["Dias em aberto"])
+
+    if "Data de abertura" in result.columns:
+        result["Data de abertura"] = pd.to_datetime(
+            result["Data de abertura"], errors="coerce", dayfirst=True
+        ).dt.date
+
+    extra_cols = [c for c in df.columns if c not in set(column_map.values())]
+    for col in extra_cols:
+        result[str(col)] = df[col]
+
+    return result
+
+
+def _opened_today(df: pd.DataFrame, report_date: date) -> pd.DataFrame:
+    if "Data de abertura" not in df.columns:
+        return pd.DataFrame()
+    return df[df["Data de abertura"] == report_date].copy()
+
+
+def _provider_summary(df: pd.DataFrame) -> pd.DataFrame:
+    valid = df.copy()
+    valid["Provedor"] = valid["Provedor"].replace({"": "Não identificado", "nan": "Não identificado"})
+    summary = (
+        valid.groupby("Provedor", dropna=False)
+        .agg(
+            Quantidade=("Ticket/OS", "count"),
+            **{
+                "Média de dias em aberto": ("Dias em aberto", "mean"),
+                "Maior tempo em aberto": ("Dias em aberto", "max"),
+            },
+        )
+        .reset_index()
+        .sort_values(["Quantidade", "Maior tempo em aberto"], ascending=False)
+    )
+    summary["Média de dias em aberto"] = summary["Média de dias em aberto"].round(1)
+    return summary
+
+
+def _uf_summary(df: pd.DataFrame) -> pd.DataFrame:
+    total = len(df)
+    summary = (
+        df.groupby("UF", dropna=False)
+        .agg(Quantidade=("Ticket/OS", "count"))
+        .reset_index()
+        .sort_values("Quantidade", ascending=False)
+    )
+    summary["UF"] = summary["UF"].replace({"": "Não informado", "nan": "Não informado"})
+    summary["Percentual"] = summary["Quantidade"].map(lambda x: f"{(x / total * 100):.1f}%" if total else "0%")
+    return summary
+
+
+def _automatic_alerts(df: pd.DataFrame, provider_summary: pd.DataFrame, uf_summary: pd.DataFrame) -> list[str]:
+    alerts = []
+    over_100 = int((df["Dias em aberto"] > 100).sum())
+    if over_100:
+        alerts.append(f"{over_100} chamado(s) com mais de 100 dias em aberto.")
+
+    if not provider_summary.empty:
+        top_provider = provider_summary.iloc[0]
+        alerts.append(
+            f"Maior concentração por provedor: {top_provider['Provedor']} "
+            f"com {int(top_provider['Quantidade'])} chamado(s)."
+        )
+
+    if not uf_summary.empty:
+        top_uf = uf_summary.iloc[0]
+        alerts.append(f"UF com maior volume: {top_uf['UF']} com {int(top_uf['Quantidade'])} chamado(s).")
+
+    without_provider = int(df["Provedor"].astype(str).str.strip().isin(["", "nan", "—", "-"]).sum())
+    if without_provider:
+        alerts.append(f"{without_provider} registro(s) sem provedor identificado.")
+
+    empty_tickets = int(df["Ticket/OS"].astype(str).str.strip().isin(["", "nan"]).sum())
+    if empty_tickets:
+        alerts.append(f"{empty_tickets} registro(s) sem Ticket/OS preenchido.")
+
+    urgent_mask = df.astype(str).apply(
+        lambda row: row.str.contains("urgent|critico|crítico", case=False, regex=True).any(),
+        axis=1,
+    )
+    urgent_count = int(urgent_mask.sum())
+    if urgent_count:
+        alerts.append(f"{urgent_count} chamado(s) com indicação de urgência ou criticidade na planilha.")
+
+    return alerts
+
+
+def build_daily_closing(
+    report_date: date,
+    responsible: str,
+    uploaded_file,
+    updated_text: str,
+    closed_text: str,
+    observations: str,
+    attention_points: str,
+    next_actions: str,
+) -> tuple[dict | None, str | None]:
+    df, _, _, error = read_daily_sheet(uploaded_file)
+    if error:
+        return None, error
+
+    updated_items = parse_multiline_items(updated_text)
+    closed_items = parse_multiline_items(closed_text)
+    opened_today = _opened_today(df, report_date)
+    critical = df.sort_values("Dias em aberto", ascending=False).head(15)
+    provider_summary = _provider_summary(df)
+    uf_summary = _uf_summary(df)
+    alerts = _automatic_alerts(df, provider_summary, uf_summary)
+    manual_attention = parse_multiline_items(attention_points)
+
+    payload = {
+        "report_date": report_date.isoformat(),
+        "report_date_display": report_date.strftime("%d/%m/%Y"),
+        "responsible": responsible.strip() or "Não informado",
+        "source_file": getattr(uploaded_file, "name", "planilha.xlsx"),
+        "updated_items": updated_items,
+        "closed_items": closed_items,
+        "observations": str(observations or "").strip(),
+        "attention_points": str(attention_points or "").strip(),
+        "manual_attention_items": manual_attention,
+        "next_actions": str(next_actions or "").strip(),
+        "indicators": {
+            "total_open": int(len(df)),
+            "over_30": int((df["Dias em aberto"] > 30).sum()),
+            "over_60": int((df["Dias em aberto"] > 60).sum()),
+            "over_100": int((df["Dias em aberto"] > 100).sum()),
+            "affected_providers": int(df["Provedor"].replace("", pd.NA).dropna().nunique()),
+            "opened_today": int(len(opened_today)),
+        },
+        "alerts": alerts,
+        "critical_rows": _records(critical),
+        "provider_summary": _records(provider_summary),
+        "uf_summary": _records(uf_summary),
+        "opened_today_rows": _records(opened_today),
+        "full_rows": _records(df),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    return payload, None
+
+
+def daily_report_markdown(closing: dict) -> str:
+    data = closing.get("report_date_display", closing.get("report_date", ""))
+    updated = closing.get("updated_items", [])
+    closed = closing.get("closed_items", [])
+    observations = closing.get("observations") or "Não foram registradas observações operacionais adicionais."
+    attention_manual = closing.get("manual_attention_items", [])
+    next_actions = closing.get("next_actions") or "Manter acompanhamento dos chamados críticos e pendências com as provedoras."
+
+    def bullet(items: list[str], empty: str) -> str:
+        if not items:
+            return empty
+        return "\n".join(f"- {item}" for item in items)
+
+    indicators = closing.get("indicators", {})
+    alerts = closing.get("alerts", []) + attention_manual
+
+    return f"""# Relatório Diário de Monitoramento - Rede Externa
+
+Responsável: {closing.get('responsible', 'Não informado')}
+Data: {data}
+
+## 1. Resumo das Atividades do Dia
+
+No dia {data}, foram realizadas atividades de acompanhamento, atualização e tratamento dos chamados de Rede Externa vinculados ao projeto. Foram atualizados os seguintes chamados no sistema:
+
+{bullet(updated, "Não foram informados chamados atualizados para esta data.")}
+
+Também foram encerrados os seguintes chamados:
+
+{bullet(closed, "Não foram informados chamados encerrados para esta data.")}
+
+Além disso, foi mantido contato e monitoramento junto às provedoras responsáveis. Os casos pendentes permanecem aguardando atuação das operadoras, com prioridade para chamados classificados como urgentes e com maior tempo em aberto.
+
+## 2. Indicadores Gerais
+
+- Total de chamados em aberto: {indicators.get('total_open', 0)}
+- Chamados acima de 30 dias: {indicators.get('over_30', 0)}
+- Chamados acima de 60 dias: {indicators.get('over_60', 0)}
+- Chamados acima de 100 dias: {indicators.get('over_100', 0)}
+- Provedores afetados: {indicators.get('affected_providers', 0)}
+- Chamados abertos hoje: {indicators.get('opened_today', 0)}
+
+## 3. Pontos de Atenção
+
+{bullet(alerts, "Não há pontos de atenção adicionais registrados.")}
+
+## 4. Observações Operacionais
+
+{observations}
+
+## 5. Próximas Ações
+
+{next_actions}
+"""
+
+
+def _pdf_paragraph(text: Any, style):
+    from reportlab.platypus import Paragraph
+
+    clean = str(text if text is not None else "").replace("\n", "<br/>")
+    return Paragraph(clean, style)
+
+
+def _pdf_table(data: list[list[Any]], widths=None, header=True):
+    from reportlab.lib import colors
+    from reportlab.platypus import Table, TableStyle
+
+    table = Table(data, colWidths=widths, repeatRows=1 if header else 0, hAlign="LEFT")
+    style = [
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("LEADING", (0, 0), (-1, -1), 10),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D7DEE9")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]
+    if header:
+        style.extend(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F2937")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ]
+        )
+        if len(data) > 1:
+            style.append(("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]))
+    table.setStyle(TableStyle(style))
+    return table
+
+
+def _pdf_section(title: str, styles):
+    from reportlab.lib import colors
+    from reportlab.platypus import Paragraph, Table, TableStyle
+
+    table = Table([[Paragraph(title, styles["SectionTitle"])]], colWidths=[520])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#E5E7EB")),
+                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    return table
+
+
+def _pdf_bullets(items: list[str], empty_message: str, styles):
+    from reportlab.platypus import ListFlowable, ListItem, Paragraph
+
+    if not items:
+        return [Paragraph(empty_message, styles["Body"])]
+    return [
+        ListFlowable(
+            [ListItem(Paragraph(str(item), styles["Body"]), leftIndent=12) for item in items],
+            bulletType="bullet",
+            start="circle",
+            leftIndent=18,
+        )
+    ]
+
+
+def generate_daily_report_pdf(closing: dict) -> bytes:
+    from io import BytesIO
+
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import cm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=1.25 * cm,
+        leftMargin=1.25 * cm,
+        topMargin=1.15 * cm,
+        bottomMargin=1.15 * cm,
+        title="Relatório Diário de Monitoramento - Rede Externa",
+    )
+
+    base = getSampleStyleSheet()
+    styles = {
+        "Title": ParagraphStyle(
+            "HubTitle",
+            parent=base["Title"],
+            alignment=TA_CENTER,
+            fontName="Helvetica-Bold",
+            fontSize=16,
+            leading=20,
+            textColor=colors.HexColor("#111827"),
+            spaceAfter=4,
+        ),
+        "Subtitle": ParagraphStyle(
+            "HubSubtitle",
+            parent=base["Normal"],
+            alignment=TA_CENTER,
+            fontName="Helvetica",
+            fontSize=9,
+            leading=12,
+            textColor=colors.HexColor("#475569"),
+            spaceAfter=12,
+        ),
+        "SectionTitle": ParagraphStyle(
+            "HubSectionTitle",
+            parent=base["Normal"],
+            alignment=TA_LEFT,
+            fontName="Helvetica-Bold",
+            fontSize=10,
+            leading=13,
+            textColor=colors.HexColor("#111827"),
+        ),
+        "Body": ParagraphStyle(
+            "HubBody",
+            parent=base["BodyText"],
+            fontName="Helvetica",
+            fontSize=9,
+            leading=12,
+            textColor=colors.HexColor("#111827"),
+            spaceAfter=7,
+        ),
+        "Small": ParagraphStyle(
+            "HubSmall",
+            parent=base["BodyText"],
+            fontName="Helvetica",
+            fontSize=8,
+            leading=10,
+            textColor=colors.HexColor("#475569"),
+        ),
+    }
+
+    story = [
+        Paragraph("Relatório Diário de Monitoramento - Rede Externa", styles["Title"]),
+        Paragraph("Hub Redes - EACE", styles["Subtitle"]),
+    ]
+
+    report_date = closing.get("report_date_display", closing.get("report_date", ""))
+    metadata = [
+        ["Data do relatório", report_date, "Responsável", closing.get("responsible", "Não informado")],
+        ["Fonte", closing.get("source_file", "planilha.xlsx"), "Gerado em", datetime.now().strftime("%d/%m/%Y %H:%M")],
+    ]
+    story.append(_pdf_table(metadata, widths=[3.2 * cm, 6.0 * cm, 3.0 * cm, 6.0 * cm], header=False))
+    story.append(Spacer(1, 10))
+
+    story.append(_pdf_section("1. Resumo das Atividades do Dia", styles))
+    story.append(Spacer(1, 6))
+    story.append(
+        Paragraph(
+            f"No dia {report_date}, foram realizadas atividades de acompanhamento, atualização e tratamento "
+            "dos chamados de Rede Externa vinculados ao projeto.",
+            styles["Body"],
+        )
+    )
+    story.append(Paragraph("<b>Chamados/INEPs atualizados no sistema:</b>", styles["Body"]))
+    story.extend(_pdf_bullets(closing.get("updated_items", []), "Não foram informados chamados atualizados para esta data.", styles))
+    story.append(Paragraph("<b>Chamados/INEPs encerrados:</b>", styles["Body"]))
+    story.extend(_pdf_bullets(closing.get("closed_items", []), "Não foram informados chamados encerrados para esta data.", styles))
+    story.append(
+        Paragraph(
+            "Além disso, foi mantido contato e monitoramento junto às provedoras responsáveis. "
+            "Os casos pendentes permanecem aguardando atuação das operadoras, com prioridade para chamados "
+            "classificados como urgentes e com maior tempo em aberto.",
+            styles["Body"],
+        )
+    )
+
+    story.append(_pdf_section("2. Indicadores Gerais", styles))
+    story.append(Spacer(1, 6))
+    indicator_rows = [["Indicador", "Quantidade"]] + _indicators_dataframe(closing.get("indicators", {})).values.tolist()
+    story.append(_pdf_table(indicator_rows, widths=[12.5 * cm, 4.0 * cm]))
+    story.append(Spacer(1, 10))
+
+    story.append(_pdf_section("3. Chamados Mais Críticos", styles))
+    story.append(Spacer(1, 6))
+    critical_df = pd.DataFrame(closing.get("critical_rows", []))
+    if critical_df.empty:
+        story.append(Paragraph("Não há chamados críticos para exibir.", styles["Body"]))
+    else:
+        cols = [c for c in ["Ticket/OS", "INEP", "Escola", "UF", "Provedor", "Dias em aberto", "Analista"] if c in critical_df.columns]
+        critical_df = critical_df[cols].head(15).astype(str)
+        rows = [cols] + critical_df.map(lambda x: x[:42] + "..." if len(x) > 45 else x).values.tolist()
+        story.append(_pdf_table(rows, widths=[2.4 * cm, 2.2 * cm, 4.3 * cm, 1.2 * cm, 3.5 * cm, 2.0 * cm, 2.4 * cm]))
+    story.append(Spacer(1, 10))
+
+    story.append(_pdf_section("4. Chamados por Provedor", styles))
+    story.append(Spacer(1, 6))
+    provider_df = pd.DataFrame(closing.get("provider_summary", []))
+    if provider_df.empty:
+        story.append(Paragraph("Não há dados por provedor.", styles["Body"]))
+    else:
+        cols = provider_df.columns.tolist()
+        rows = [cols] + provider_df.head(20).astype(str).values.tolist()
+        story.append(_pdf_table(rows, widths=[7.2 * cm, 3.0 * cm, 4.0 * cm, 3.2 * cm]))
+    story.append(Spacer(1, 10))
+
+    story.append(_pdf_section("5. Distribuição por Estado", styles))
+    story.append(Spacer(1, 6))
+    uf_df = pd.DataFrame(closing.get("uf_summary", []))
+    if uf_df.empty:
+        story.append(Paragraph("Não há dados por UF.", styles["Body"]))
+    else:
+        rows = [uf_df.columns.tolist()] + uf_df.astype(str).values.tolist()
+        story.append(_pdf_table(rows, widths=[5.0 * cm, 5.5 * cm, 5.5 * cm]))
+    story.append(Spacer(1, 10))
+
+    story.append(_pdf_section("6. Pontos de Atenção", styles))
+    story.append(Spacer(1, 6))
+    story.extend(_pdf_bullets(
+        closing.get("alerts", []) + closing.get("manual_attention_items", []),
+        "Não há pontos de atenção adicionais registrados.",
+        styles,
+    ))
+
+    story.append(_pdf_section("7. Observações Operacionais", styles))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(closing.get("observations") or "Não foram registradas observações operacionais adicionais.", styles["Body"]))
+
+    story.append(_pdf_section("8. Próximas Ações", styles))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(closing.get("next_actions") or "Manter acompanhamento dos chamados críticos e pendências com as provedoras.", styles["Body"]))
+
+    def footer(canvas, document):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.HexColor("#64748B"))
+        canvas.drawString(1.25 * cm, 0.7 * cm, "Hub Redes - EACE")
+        canvas.drawRightString(A4[0] - 1.25 * cm, 0.7 * cm, f"Página {document.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return buffer.getvalue()
+
+
+def _render_item_list(items: list[str], empty_message: str) -> None:
+    if items:
+        for item in items:
+            st.markdown(f"- {item}")
+    else:
+        st.info(empty_message)
+
+
+def render_daily_report(closing: dict | None) -> None:
+    st.markdown("### Relatório Diário de Monitoramento — Rede Externa")
+
+    history = list_daily_closings()
+    if not closing:
+        closing = load_current_daily_closing()
+
+    report_options = []
+    if closing:
+        report_options.append(
+            {
+                "label": "Relatório atual",
+                "path": closing.get("history_path"),
+                "data": closing,
+                "is_current": True,
+            }
+        )
+    report_options.extend({**item, "is_current": False} for item in history)
+
+    if report_options:
+        if "daily_report_history_select" in st.session_state and not isinstance(
+            st.session_state.daily_report_history_select, dict
+        ):
+            del st.session_state.daily_report_history_select
+
+        col_history, col_delete = st.columns([12, 1])
+        with col_history:
+            selected_report = st.selectbox(
+                "Consultar histórico",
+                report_options,
+                format_func=lambda item: item["label"],
+                key="daily_report_history_select",
+            )
+        with col_delete:
+            st.markdown("<div style='height: 1.7rem'></div>", unsafe_allow_html=True)
+            if st.button("🗑️", key="delete_daily_report", help="Excluir relatório selecionado", use_container_width=True):
+                st.session_state.daily_report_delete_pending = selected_report
+
+        pending_delete = st.session_state.get("daily_report_delete_pending")
+        if pending_delete:
+            with st.expander("Confirmar exclusão de relatório", expanded=True):
+                st.warning(
+                    f"Você está prestes a excluir: {pending_delete.get('label', 'relatório selecionado')}. "
+                    "Essa ação remove o relatório para todos os usuários."
+                )
+                delete_password = st.text_input(
+                    "Senha para excluir",
+                    type="password",
+                    key="daily_report_delete_password",
+                )
+                confirm_col, cancel_col = st.columns(2)
+                if confirm_col.button("Confirmar exclusão", type="primary", use_container_width=True):
+                    if not check_daily_report_password(delete_password):
+                        st.error("Senha inválida.")
+                    else:
+                        ok = delete_daily_closing(pending_delete.get("path"))
+                        if pending_delete.get("is_current"):
+                            clear_current_daily_closing()
+                        st.session_state.daily_report_current = None
+                        st.session_state.daily_report_delete_pending = None
+                        if "daily_report_delete_password" in st.session_state:
+                            del st.session_state.daily_report_delete_password
+                        if ok:
+                            st.success("Relatório excluído. Ele não ficará mais acessível para outros usuários.")
+                        else:
+                            st.error("Não foi possível excluir o relatório selecionado.")
+                        st.rerun()
+                if cancel_col.button("Cancelar", use_container_width=True):
+                    st.session_state.daily_report_delete_pending = None
+                    if "daily_report_delete_password" in st.session_state:
+                        del st.session_state.daily_report_delete_password
+                    st.rerun()
+        closing = selected_report["data"]
+
+    if not closing:
+        st.info("Nenhum fechamento diário concluído ainda. Use a Área Restrita na lateral para gerar o relatório.")
+        return
+
+    indicators = closing.get("indicators", {})
+    st.caption(
+        f"Data: {closing.get('report_date_display', closing.get('report_date', ''))} | "
+        f"Responsável: {closing.get('responsible', 'Não informado')} | "
+        f"Fonte: {closing.get('source_file', 'planilha.xlsx')}"
+    )
+
+    st.markdown("""
+    <div class="saas-grid">
+      <div class="saas-card"><div class="saas-card-label">Chamados abertos</div>
+        <div class="saas-card-value c-blue">{total}</div><div class="saas-card-sub">planilha diária</div></div>
+      <div class="saas-card"><div class="saas-card-label">Acima de 30 dias</div>
+        <div class="saas-card-value c-yellow">{over30}</div><div class="saas-card-sub">atenção</div></div>
+      <div class="saas-card"><div class="saas-card-label">Acima de 60 dias</div>
+        <div class="saas-card-value c-red">{over60}</div><div class="saas-card-sub">prioridade</div></div>
+      <div class="saas-card"><div class="saas-card-label">Acima de 100 dias</div>
+        <div class="saas-card-value c-red">{over100}</div><div class="saas-card-sub">crítico</div></div>
+      <div class="saas-card"><div class="saas-card-label">Provedores</div>
+        <div class="saas-card-value c-teal">{providers}</div><div class="saas-card-sub">afetados</div></div>
+      <div class="saas-card"><div class="saas-card-label">Abertos hoje</div>
+        <div class="saas-card-value c-purple">{opened}</div><div class="saas-card-sub">na data do relatório</div></div>
+    </div>
+    """.format(
+        total=indicators.get("total_open", 0),
+        over30=indicators.get("over_30", 0),
+        over60=indicators.get("over_60", 0),
+        over100=indicators.get("over_100", 0),
+        providers=indicators.get("affected_providers", 0),
+        opened=indicators.get("opened_today", 0),
+    ), unsafe_allow_html=True)
+
+    st.markdown("#### 1. Resumo das Atividades do Dia")
+    report_date = closing.get("report_date_display", closing.get("report_date", ""))
+    st.write(
+        f"No dia {report_date}, foram realizadas atividades de acompanhamento, atualização e tratamento "
+        "dos chamados de Rede Externa vinculados ao projeto."
+    )
+    st.markdown("**Chamados/INEPs atualizados no sistema:**")
+    _render_item_list(closing.get("updated_items", []), "Não foram informados chamados atualizados para esta data.")
+    st.markdown("**Chamados/INEPs encerrados:**")
+    _render_item_list(closing.get("closed_items", []), "Não foram informados chamados encerrados para esta data.")
+    st.write(
+        "Além disso, foi mantido contato e monitoramento junto às provedoras responsáveis. "
+        "Os casos pendentes permanecem aguardando atuação das operadoras, com prioridade para chamados "
+        "classificados como urgentes e com maior tempo em aberto."
+    )
+
+    st.markdown("#### 2. Atividades Executadas Hoje")
+    for item in [
+        "Atualização de chamados no portal;",
+        "Validação de status das escolas;",
+        "Consulta de provedores responsáveis;",
+        "Priorização dos chamados críticos;",
+        "Acompanhamento dos casos com mais de 30/60/100 dias;",
+        "Registro de observações operacionais;",
+        "Encaminhamento/monitoramento junto às provedoras.",
+    ]:
+        st.markdown(f"- {item}")
+    if closing.get("observations"):
+        st.markdown("**Complemento operacional:**")
+        st.write(closing["observations"])
+
+    st.markdown("#### 3. Indicadores Gerais")
+    st.dataframe(_indicators_dataframe(indicators), use_container_width=True, hide_index=True)
+
+    st.markdown("#### 4. Chamados Mais Críticos")
+    critical_df = pd.DataFrame(closing.get("critical_rows", []))
+    if critical_df.empty:
+        st.info("Não há chamados críticos para exibir.")
+    else:
+        columns = [c for c in ["Ticket/OS", "INEP", "Escola", "UF", "Provedor", "Dias em aberto", "Analista"] if c in critical_df.columns]
+        st.dataframe(critical_df[columns], use_container_width=True, hide_index=True, height=420)
+
+    st.markdown("#### 5. Chamados por Provedor")
+    provider_df = pd.DataFrame(closing.get("provider_summary", []))
+    if provider_df.empty:
+        st.info("Não há dados por provedor.")
+    else:
+        st.dataframe(provider_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### 6. Distribuição por Estado")
+    uf_df = pd.DataFrame(closing.get("uf_summary", []))
+    if uf_df.empty:
+        st.info("Não há dados por UF.")
+    else:
+        st.dataframe(uf_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### 7. Chamados Abertos Hoje")
+    opened_df = pd.DataFrame(closing.get("opened_today_rows", []))
+    if opened_df.empty:
+        st.info("Nenhum chamado aberto na data do relatório, ou a planilha não contém coluna de data de abertura.")
+    else:
+        columns = [c for c in ["Ticket/OS", "INEP", "Escola", "UF", "Provedor", "Data de abertura"] if c in opened_df.columns]
+        st.dataframe(opened_df[columns], use_container_width=True, hide_index=True)
+
+    st.markdown("#### 8. Pontos de Atenção")
+    all_alerts = closing.get("alerts", []) + closing.get("manual_attention_items", [])
+    _render_item_list(all_alerts, "Não há pontos de atenção adicionais registrados.")
+
+    st.markdown("#### 9. Observações Operacionais")
+    st.write(closing.get("observations") or "Não foram registradas observações operacionais adicionais.")
+
+    st.markdown("#### 10. Listagem Completa")
+    full_df = pd.DataFrame(closing.get("full_rows", []))
+    if full_df.empty:
+        st.info("A listagem completa não está disponível para este fechamento.")
+    else:
+        col_search, col_uf, col_provider = st.columns([2, 1, 1])
+        query = col_search.text_input("Pesquisar Ticket, INEP ou Escola", key="daily_full_search")
+        uf_options = sorted([x for x in full_df.get("UF", pd.Series(dtype=str)).dropna().astype(str).unique() if x])
+        provider_options = sorted([x for x in full_df.get("Provedor", pd.Series(dtype=str)).dropna().astype(str).unique() if x])
+        uf_filter = col_uf.multiselect("UF", uf_options, key="daily_full_uf")
+        provider_filter = col_provider.multiselect("Provedor", provider_options, key="daily_full_provider")
+
+        filtered = full_df.copy()
+        if query.strip():
+            q = query.strip()
+            search_cols = [c for c in ["Ticket/OS", "INEP", "Escola"] if c in filtered.columns]
+            mask = filtered[search_cols].astype(str).apply(
+                lambda row: row.str.contains(q, case=False, na=False).any(), axis=1
+            )
+            filtered = filtered[mask]
+        if uf_filter:
+            filtered = filtered[filtered["UF"].isin(uf_filter)]
+        if provider_filter:
+            filtered = filtered[filtered["Provedor"].isin(provider_filter)]
+        st.dataframe(filtered, use_container_width=True, hide_index=True, height=520)
+
+    pdf_bytes = generate_daily_report_pdf(closing)
+    st.download_button(
+        "Baixar relatório em PDF",
+        pdf_bytes,
+        file_name=f"relatorio_diario_{closing.get('report_date', date.today().isoformat())}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
+
+def render_daily_closing_admin() -> None:
+    st.markdown('<div class="sidebar-label">Área Restrita</div>', unsafe_allow_html=True)
+    with st.expander("Fechamento Diário", expanded=False):
+        if not st.session_state.get("daily_report_authenticated"):
+            password = st.text_input("Senha", type="password", key="daily_report_password_input")
+            if st.button("Entrar", key="daily_report_login", use_container_width=True):
+                if check_daily_report_password(password):
+                    st.session_state.daily_report_authenticated = True
+                    st.success("Acesso liberado.")
+                    st.rerun()
+                else:
+                    st.error("Senha inválida.")
+            return
+
+        st.caption("Upload e edição ficam restritos a esta área.")
+        report_date = st.date_input("Data do relatório", value=date.today(), key="daily_report_date")
+        responsible = st.text_input("Responsável", key="daily_report_responsible")
+        uploaded = st.file_uploader(
+            "Planilha diária de chamados (.xlsx)",
+            type=["xlsx"],
+            key="daily_report_upload",
+        )
+        updated_text = st.text_area("Chamados/INEPs atualizados hoje", height=110, key="daily_report_updated")
+        closed_text = st.text_area("Chamados/INEPs encerrados hoje", height=110, key="daily_report_closed")
+        observations = st.text_area("Observações operacionais", height=120, key="daily_report_observations")
+        attention = st.text_area("Pontos de atenção", height=100, key="daily_report_attention")
+        next_actions = st.text_area("Próximas ações recomendadas", height=100, key="daily_report_next_actions")
+
+        if st.button("Concluir Fechamento", type="primary", use_container_width=True):
+            closing, error = build_daily_closing(
+                report_date=report_date,
+                responsible=responsible,
+                uploaded_file=uploaded,
+                updated_text=updated_text,
+                closed_text=closed_text,
+                observations=observations,
+                attention_points=attention,
+                next_actions=next_actions,
+            )
+            if error:
+                st.error(error)
+            else:
+                st.session_state.daily_report_current = closing
+                save_daily_closing(closing)
+                st.success("Fechamento concluído e relatório atualizado.")
+                st.rerun()
+
+        if st.button("Limpar fechamento atual", use_container_width=True):
+            st.session_state.daily_report_current = None
+            clear_current_daily_closing()
+            st.success("Fechamento atual limpo. O histórico foi mantido para consulta.")
+            st.rerun()
+
+        if st.button("Sair da área restrita", use_container_width=True):
+            st.session_state.daily_report_authenticated = False
+            st.rerun()

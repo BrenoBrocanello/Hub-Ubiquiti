@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from io import BytesIO
 
+from modules.daily_report import render_daily_closing_admin, render_daily_report
+
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
@@ -30,14 +32,119 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-.stApp { background: #0f1117; }
-
-[data-testid="stSidebar"] > div:first-child {
-    background: #161b27;
-    border-right: 1px solid #1e2535;
+:root, .stApp {
+    --hub-bg: var(--background-color, #f3f6fb);
+    --hub-sidebar-bg: var(--secondary-background-color, #ffffff);
+    --hub-surface: var(--secondary-background-color, #ffffff);
+    --hub-surface-2: var(--background-color, #f8fafc);
+    --hub-border: #d7dee9;
+    --hub-text: var(--text-color, #111827);
+    --hub-muted: color-mix(in srgb, var(--hub-text) 72%, transparent);
+    --hub-muted-2: color-mix(in srgb, var(--hub-text) 58%, transparent);
+    --hub-log-bg: var(--secondary-background-color, #f8fafc);
+    --hub-scroll: #cbd5e1;
+    --hub-accent: #ef4444;
+    --hub-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    --hub-blue: #2563eb;
+    --hub-green: #16a34a;
+    --hub-red: #dc2626;
+    --hub-yellow: #ca8a04;
+    --hub-gray: #6b7280;
+    --hub-teal: #0891b2;
+    --hub-purple: #7c3aed;
 }
 
-.block-container { padding-top: 2rem !important; max-width: 1400px !important; }
+@media (prefers-color-scheme: dark) {
+    :root, .stApp {
+        --hub-bg: #0f1117;
+        --hub-sidebar-bg: #161b27;
+        --hub-surface: #161b27;
+        --hub-surface-2: #0a0d14;
+        --hub-border: #273244;
+        --hub-text: #f8fafc;
+        --hub-muted: #cbd5e1;
+        --hub-muted-2: #94a3b8;
+        --hub-log-bg: #0a0d14;
+        --hub-scroll: #475569;
+        --hub-accent: #f87171;
+        --hub-shadow: none;
+        --hub-blue: #60a5fa;
+        --hub-green: #4ade80;
+        --hub-red: #f87171;
+        --hub-yellow: #facc15;
+        --hub-gray: #94a3b8;
+        --hub-teal: #22d3ee;
+        --hub-purple: #c084fc;
+    }
+}
+
+html[data-theme="light"], body[data-theme="light"], .stApp[data-theme="light"],
+[data-testid="stAppViewContainer"][data-theme="light"], [data-baseweb-theme="light"],
+[data-theme="light"] {
+    --hub-bg: #f3f6fb;
+    --hub-sidebar-bg: #ffffff;
+    --hub-surface: #ffffff;
+    --hub-surface-2: #f8fafc;
+    --hub-border: #d7dee9;
+    --hub-text: #111827;
+    --hub-muted: #475569;
+    --hub-muted-2: #64748b;
+    --hub-log-bg: #f8fafc;
+    --hub-scroll: #cbd5e1;
+    --hub-accent: #ef4444;
+    --hub-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    --hub-blue: #2563eb;
+    --hub-green: #16a34a;
+    --hub-red: #dc2626;
+    --hub-yellow: #ca8a04;
+    --hub-gray: #6b7280;
+    --hub-teal: #0891b2;
+    --hub-purple: #7c3aed;
+}
+
+html[data-theme="dark"], body[data-theme="dark"], .stApp[data-theme="dark"],
+[data-testid="stAppViewContainer"][data-theme="dark"], [data-baseweb-theme="dark"],
+[data-theme="dark"], .dark {
+    --hub-bg: #0f1117;
+    --hub-sidebar-bg: #161b27;
+    --hub-surface: #161b27;
+    --hub-surface-2: #0a0d14;
+    --hub-border: #273244;
+    --hub-text: #f8fafc;
+    --hub-muted: #cbd5e1;
+    --hub-muted-2: #94a3b8;
+    --hub-log-bg: #0a0d14;
+    --hub-scroll: #475569;
+    --hub-accent: #f87171;
+    --hub-shadow: none;
+    --hub-blue: #60a5fa;
+    --hub-green: #4ade80;
+    --hub-red: #f87171;
+    --hub-yellow: #facc15;
+    --hub-gray: #94a3b8;
+    --hub-teal: #22d3ee;
+    --hub-purple: #c084fc;
+}
+
+html, body,
+.stApp,
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"] {
+    background: var(--hub-bg) !important;
+    color: var(--hub-text) !important;
+}
+
+[data-testid="stHeader"] {
+    background: var(--hub-bg) !important;
+    box-shadow: none !important;
+}
+
+[data-testid="stSidebar"] > div:first-child {
+    background: var(--hub-sidebar-bg) !important;
+    border-right: 1px solid var(--hub-border) !important;
+}
+
+.block-container { padding-top: 3.4rem !important; max-width: 1400px !important; }
 * { word-break: break-word !important; overflow-wrap: break-word !important; }
 
 .saas-grid {
@@ -53,18 +160,19 @@ st.markdown("""
     margin: 20px 0 24px 0;
 }
 .saas-card {
-    background: #161b27;
-    border: 1px solid #1e2535;
+    background: var(--hub-surface);
+    border: 1px solid var(--hub-border);
     border-radius: 10px;
     padding: 16px 18px;
     min-width: 0;
+    box-shadow: var(--hub-shadow);
 }
 .saas-card-label {
     font-size: 10px;
     font-weight: 600;
     letter-spacing: 0.8px;
     text-transform: uppercase;
-    color: #4b5563;
+    color: var(--hub-muted);
     margin-bottom: 8px;
     font-family: Inter, sans-serif;
 }
@@ -76,31 +184,36 @@ st.markdown("""
 }
 .saas-card-sub {
     font-size: 11px;
-    color: #374151;
+    color: var(--hub-muted-2);
     margin-top: 6px;
     font-family: Inter, sans-serif;
 }
-.c-blue   { color: #3b82f6; }
-.c-green  { color: #22c55e; }
-.c-red    { color: #ef4444; }
-.c-yellow { color: #eab308; }
-.c-gray   { color: #6b7280; }
-.c-teal   { color: #38bdf8; }
-.c-purple { color: #a855f7; }
+.c-blue   { color: var(--hub-blue); }
+.c-green  { color: var(--hub-green); }
+.c-red    { color: var(--hub-red); }
+.c-yellow { color: var(--hub-yellow); }
+.c-gray   { color: var(--hub-gray); }
+.c-teal   { color: var(--hub-teal); }
+.c-purple { color: var(--hub-purple); }
 
 .page-title {
     font-family: Inter, sans-serif;
     font-size: 22px;
     font-weight: 700;
-    color: #f9fafb;
+    color: var(--hub-text);
     margin: 0;
+    line-height: 1.35;
+    min-height: 32px;
+    padding-top: 2px;
+    overflow: visible;
 }
 .page-sub {
     font-family: Inter, sans-serif;
     font-size: 12px;
-    color: #4b5563;
+    color: var(--hub-muted);
     margin-top: 3px;
     letter-spacing: 0.5px;
+    line-height: 1.35;
 }
 
 .sidebar-label {
@@ -109,15 +222,15 @@ st.markdown("""
     font-weight: 600;
     letter-spacing: 1.2px;
     text-transform: uppercase;
-    color: #374151;
+    color: var(--hub-muted-2);
     margin: 16px 0 8px 0;
     padding-bottom: 6px;
-    border-bottom: 1px solid #1e2535;
+    border-bottom: 1px solid var(--hub-border);
 }
 
 .log-box {
-    background: #0a0d14;
-    border: 1px solid #1e2535;
+    background: var(--hub-log-bg);
+    border: 1px solid var(--hub-border);
     border-radius: 8px;
     padding: 12px 16px;
     font-family: 'Courier New', monospace;
@@ -133,8 +246,8 @@ st.markdown("""
 
 .ts-pill {
     display: inline-block;
-    background: #161b27;
-    border: 1px solid #1e2535;
+    background: var(--hub-surface);
+    border: 1px solid var(--hub-border);
     border-radius: 6px;
     padding: 3px 10px;
     font-size: 11px;
@@ -145,13 +258,56 @@ st.markdown("""
 
 .saas-divider {
     border: none;
-    border-top: 1px solid #1e2535;
+    border-top: 1px solid var(--hub-border);
     margin: 20px 0;
 }
 
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #1e2535; border-radius: 99px; }
+::-webkit-scrollbar-thumb { background: var(--hub-scroll); border-radius: 99px; }
+
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
+[data-testid="stSidebar"] [data-testid="stMetricLabel"],
+[data-testid="stSidebar"] [data-testid="stMetricValue"] {
+    color: var(--hub-text) !important;
+}
+
+[data-testid="stSidebar"] .sidebar-label {
+    color: var(--hub-muted) !important;
+}
+
+[data-testid="stSidebar"] [data-baseweb="tag"] span {
+    color: #ffffff !important;
+}
+
+[data-testid="stTabs"] button {
+    color: var(--hub-muted) !important;
+}
+
+[data-testid="stTabs"] button p {
+    color: var(--hub-muted) !important;
+    font-weight: 600;
+}
+
+[data-testid="stTabs"] button[aria-selected="true"] p {
+    color: var(--hub-accent) !important;
+}
+
+[data-testid="stTabs"] [data-baseweb="tab-highlight"] {
+    background-color: var(--hub-accent) !important;
+}
+
+h1, h2, h3, h4, h5, h6,
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li {
+    color: var(--hub-text);
+}
+
+[data-testid="stAlert"] {
+    border-radius: 8px;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -268,6 +424,8 @@ for k, v in {
     "ultima_consulta":   None,
     "df_inventario":     None,
     "inv_ultima_coleta": None,
+    "daily_report_current": None,
+    "daily_report_authenticated": False,
 }.items():
     if k not in st.session_state:
         if k == "contas":
@@ -675,6 +833,8 @@ with st.sidebar:
             except Exception as ex:
                 st.caption(f"Erro ao ler Secrets: {ex}")
 
+    render_daily_closing_admin()
+
     st.markdown('<div class="sidebar-label">Status</div>', unsafe_allow_html=True)
     ca, cb = st.columns(2)
     ca.metric("Contas",  len(validas))
@@ -689,7 +849,7 @@ with st.sidebar:
 # HEADER
 # ═══════════════════════════════════════════════════════════════
 st.markdown(
-    '<p class="page-title">🛰️ Hub Redes — EACE</p>'
+    '<p class="page-title">Hub Redes — EACE</p>'
     '<p class="page-sub">Monitor de Conectividade · Ubiquiti · Omada · Zyxel · Escolas Brasileiras</p>',
     unsafe_allow_html=True
 )
@@ -698,9 +858,8 @@ st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
 # ═══════════════════════════════════════════════════════════════
 # ABAS
 # ═══════════════════════════════════════════════════════════════
-t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
-    "📊 Processar Planilha",
-    "📋 Chamados",
+t1, t2, t3, t4, t5, t6, t7 = st.tabs([
+    "📄 Relatório Diário",
     "🌐 Inventário Geral",
     "🏢 Provedores",
     "🔍 Busca Manual",
@@ -710,249 +869,17 @@ t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
 ])
 
 # ─────────────────────────────────────────
-# ABA 1 — PROCESSAR PLANILHA
+# ABA 1 - RELATORIO DIARIO
 # ─────────────────────────────────────────
 with t1:
-    col_reset, _ = st.columns([2, 5])
-    if col_reset.button("🗑️ Resetar Dados de Importação", use_container_width=True):
-        st.session_state.df_resultado    = None
-        st.session_state.relatorio       = []
-        st.session_state.ultima_consulta = None
-        st.success("Dados resetados.")
-        st.rerun()
-
-    st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
-
-    st.markdown("#### 1. Planilha de Chamados (obrigatória)")
-    col_up, col_inf = st.columns([3, 1])
-    with col_up:
-        arquivo = st.file_uploader(
-            "Planilha de chamados (.xlsx) — deve conter coluna INEP",
-            type=["xlsx"], key="up_chamados"
-        )
-    with col_inf:
-        if arquivo:
-            df_prev = pd.read_excel(arquivo, dtype={"INEP": str})
-            arquivo.seek(0)
-            n_ineps = df_prev["INEP"].dropna().astype(str).str.replace(r'\.0$','',regex=True).str.strip().nunique()
-            st.metric("Chamados", len(df_prev))
-            st.metric("INEPs únicos", n_ineps)
-        else:
-            st.info("Aguardando...")
-
-    st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
-
-    st.markdown("#### 2. Export do Omada Cloud (opcional)")
-    st.caption("Omada → On Premise Systems → botão **Export** → faça upload aqui.")
-    col_om, col_om_inf = st.columns([3, 1])
-    with col_om:
-        arquivo_omada = st.file_uploader("Export Omada (.xlsx)", type=["xlsx"], key="up_omada")
-    with col_om_inf:
-        if arquivo_omada:
-            df_om_prev = pd.read_excel(arquivo_omada)
-            arquivo_omada.seek(0)
-            n_on  = (df_om_prev["STATUS"].str.upper() == "ONLINE").sum()  if "STATUS" in df_om_prev.columns else "—"
-            n_off = (df_om_prev["STATUS"].str.upper() == "OFFLINE").sum() if "STATUS" in df_om_prev.columns else "—"
-            st.metric("Controllers", len(df_om_prev))
-            st.metric("Online / Offline", f"{n_on} / {n_off}")
-        else:
-            st.info("Opcional.")
-
-    st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
-
-    st.markdown("#### 3. Export do Zyxel Nebula (opcional)")
-    st.caption("Zyxel Nebula → Overview → Sites → ícone de download (CSV) → faça upload aqui.")
-    col_zy, col_zy_inf = st.columns([3, 1])
-    with col_zy:
-        arquivo_zyxel = st.file_uploader("Export Zyxel (.csv)", type=["csv"], key="up_zyxel")
-    with col_zy_inf:
-        if arquivo_zyxel:
-            df_zy_prev = pd.read_csv(arquivo_zyxel)
-            arquivo_zyxel.seek(0)
-            col_st = next((c for c in df_zy_prev.columns if c.strip().upper() in ("ESTADO","STATUS")), None)
-            if col_st:
-                n_ok  = (df_zy_prev[col_st].str.upper() == "OK").sum()
-                n_off = df_zy_prev[col_st].str.upper().isin(["DEVICE OFFLINE","DEVICES UNREACHABLE"]).sum()
-                n_alr = (df_zy_prev[col_st].str.upper() == "DEVICE ALERTED").sum()
-                st.metric("Sites", len(df_zy_prev))
-                st.metric("OK / Offline", f"{n_ok} / {n_off}")
-                if n_alr: st.metric("Em alerta", n_alr)
-            else:
-                st.metric("Sites", len(df_zy_prev))
-        else:
-            st.info("Opcional.")
-
-    st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
-
-    if not arquivo:
-        st.info("Faça upload da planilha de chamados para continuar.")
-    elif not alvo and not arquivo_omada and not arquivo_zyxel:
-        st.warning("Configure ao menos uma fonte: conta Ubiquiti, export Omada ou export Zyxel.")
-    else:
-        fontes = []
-        if alvo:          fontes.append(f"Ubiquiti ({len(alvo)} conta(s))")
-        if arquivo_omada: fontes.append("Omada (export)")
-        if arquivo_zyxel: fontes.append("Zyxel (export)")
-        st.success(f"Fontes prontas: {' + '.join(fontes)}")
-
-        if st.button("🔍 Iniciar Consulta em Massa", type="primary", use_container_width=True):
-            df_raw = pd.read_excel(arquivo, dtype={"INEP": str})
-            if "INEP" not in df_raw.columns:
-                st.error("Coluna 'INEP' não encontrada na planilha!")
-                st.stop()
-
-            ineps_set = set(
-                df_raw["INEP"].dropna()
-                .astype(str).str.replace(r'\.0$','',regex=True).str.strip()
-            )
-            todos = {}
-            log   = []
-            t0    = time.time()
-
-            if alvo:
-                prog = st.progress(0.0, text="Consultando Ubiquiti...")
-                with ThreadPoolExecutor(max_workers=min(len(alvo), 5)) as ex:
-                    futs = {ex.submit(buscar_ineps_ubiquiti, c["api_key"], c["apelido"], ineps_set): c["apelido"] for c in alvo}
-                    done = 0
-                    for fut in as_completed(futs):
-                        ap = futs[fut]
-                        try:
-                            res = fut.result()
-                            for inep, dados in res.items():
-                                if inep not in todos: todos[inep] = dados
-                            isps_novos = {v["ISP"] for v in res.values() if v.get("ISP","—") != "—"}
-                            qt = mesclar_isps_novos(isps_novos)
-                            log.append(("ok", f"Ubiquiti {ap}: {len(res)} escola(s) | {qt} ISP(s) novo(s)"))
-                        except Exception as e:
-                            log.append(("err", f"Ubiquiti {ap}: {e}"))
-                        done += 1
-                        prog.progress(done / len(alvo), text=f"Ubiquiti {done}/{len(alvo)}...")
-                prog.progress(1.0, text="Ubiquiti concluído.")
-
-            if arquivo_omada:
-                try:
-                    arquivo_omada.seek(0)
-                    res_om = processar_export_omada(pd.read_excel(arquivo_omada))
-                    cruzados = sum(1 for inep, d in res_om.items()
-                                   if inep in ineps_set and inep not in todos
-                                   and not todos.update({inep: d}))
-                    log.append(("ok", f"Omada: {cruzados} escola(s) cruzada(s) de {len(res_om)} controllers"))
-                except Exception as e:
-                    log.append(("err", f"Omada export: {e}"))
-
-            if arquivo_zyxel:
-                try:
-                    arquivo_zyxel.seek(0)
-                    res_zy = processar_export_zyxel(pd.read_csv(arquivo_zyxel))
-                    cruzados_zy = 0
-                    for inep, dados in res_zy.items():
-                        if inep in ineps_set and inep not in todos:
-                            todos[inep] = dados
-                            cruzados_zy += 1
-                    log.append(("ok", f"Zyxel: {cruzados_zy} escola(s) cruzada(s) de {len(res_zy)} sites"))
-                except Exception as e:
-                    log.append(("err", f"Zyxel export: {e}"))
-
-            # Deduplicação: mantém a melhor entrada por INEP
-            todos = deduplicar_por_inep(todos)
-
-            df_f = df_raw.copy()
-            df_f["INEP_K"] = df_f["INEP"].astype(str).str.replace(r'\.0$','',regex=True).str.strip()
-            for col, pad in [
-                ("Status Rede","NÃO ENCONTRADO"),("Plataforma","—"),("Uptime WAN","—"),
-                ("ISP","—"),("Conta","—"),("IP Externo","—"),("Nome no Console","—"),
-            ]:
-                df_f[col] = df_f["INEP_K"].map(lambda x, c=col, p=pad: todos.get(x, {}).get(c, p))
-            df_f.drop(columns=["INEP_K"], inplace=True)
-
-            st.session_state.df_resultado    = df_f
-            st.session_state.relatorio       = log
-            st.session_state.ultima_consulta = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-            st.success(f"Concluído em {time.time()-t0:.1f}s — {len(todos)} escola(s) localizada(s).")
-            st.info("Acesse a aba '📋 Chamados' para ver os resultados.")
+    render_daily_report(st.session_state.daily_report_current)
 
 # ─────────────────────────────────────────
-# ABA 2 — CHAMADOS
+# ABA 2 - INVENTARIO GERAL
+# ─────────────────────────────────────────
+
 # ─────────────────────────────────────────
 with t2:
-    if st.session_state.df_resultado is None:
-        st.info("Nenhuma planilha processada ainda. Vá para 'Processar Planilha'.")
-    else:
-        df = st.session_state.df_resultado
-        st.markdown(f'<div class="ts-pill">🕐 {st.session_state.ultima_consulta}</div>', unsafe_allow_html=True)
-
-        if st.session_state.relatorio:
-            html = "".join(
-                f'<div class="log-{"ok" if tp=="ok" else "err"}">{"✓" if tp=="ok" else "✗"}  {m}</div>'
-                for tp, m in st.session_state.relatorio
-            )
-            st.markdown(f'<div class="log-box">{html}</div>', unsafe_allow_html=True)
-
-        total   = len(df)
-        online  = df["Status Rede"].str.contains("ONLINE",   na=False).sum()
-        offline = df["Status Rede"].str.contains("OFFLINE",  na=False).sum()
-        n_ubi   = df["Status Rede"].str.contains("UBIQUITI", na=False).sum()
-        n_om    = df["Status Rede"].str.contains("OMADA",    na=False).sum()
-        n_zy    = df["Status Rede"].str.contains("ZYXEL",    na=False).sum()
-
-        st.markdown(f"""
-        <div class="saas-grid">
-          <div class="saas-card"><div class="saas-card-label">Total chamados</div>
-            <div class="saas-card-value c-blue">{total}</div><div class="saas-card-sub">planilha importada</div></div>
-          <div class="saas-card"><div class="saas-card-label">Online</div>
-            <div class="saas-card-value c-green">{online}</div><div class="saas-card-sub">{f"{online/total*100:.0f}%" if total else "—"}</div></div>
-          <div class="saas-card"><div class="saas-card-label">Offline / Alerta</div>
-            <div class="saas-card-value c-red">{offline}</div><div class="saas-card-sub">{f"{offline/total*100:.0f}%" if total else "—"}</div></div>
-          <div class="saas-card"><div class="saas-card-label">Ubiquiti</div>
-            <div class="saas-card-value c-blue">{n_ubi}</div><div class="saas-card-sub">identificados</div></div>
-          <div class="saas-card"><div class="saas-card-label">Omada</div>
-            <div class="saas-card-value c-teal">{n_om}</div><div class="saas-card-sub">identificados</div></div>
-          <div class="saas-card"><div class="saas-card-label">Zyxel</div>
-            <div class="saas-card-value c-purple">{n_zy}</div><div class="saas-card-sub">identificados</div></div>
-        </div>""", unsafe_allow_html=True)
-
-        with st.expander("⚙️ Filtros", expanded=True):
-            f1, f2, f3, f4, f5, f6 = st.columns(6)
-            op_st   = sorted(df["Status Rede"].dropna().unique().tolist())
-            op_plat = sorted(df["Plataforma"].dropna().unique().tolist()) if "Plataforma" in df.columns else []
-            op_isp  = sorted([v for v in df["ISP"].dropna().unique().tolist() if v not in ("—","")])
-            op_uf   = sorted(df["UF"].dropna().unique().tolist())      if "UF"       in df.columns else []
-            op_an   = sorted(df["Analista"].dropna().unique().tolist()) if "Analista" in df.columns else []
-            op_co   = sorted(df["Conta"].dropna().unique().tolist())
-            fs = f1.multiselect("Status Rede",    op_st,   default=op_st, key="fs_ch")
-            fp = f2.multiselect("Plataforma",     op_plat, default=[],    key="fp_ch")
-            fi = f3.multiselect("Provedor (ISP)", op_isp,  default=[],    key="fi_ch")
-            fu = f4.multiselect("UF",             op_uf,   default=[],    key="fu_ch")
-            fa = f5.multiselect("Analista",       op_an,   default=[],    key="fa_ch")
-            fc = f6.multiselect("Conta",          op_co,   default=[],    key="fc_ch")
-
-        dff = df[df["Status Rede"].isin(fs)]
-        if fp:                               dff = dff[dff["Plataforma"].isin(fp)]
-        if fi:                               dff = dff[dff["ISP"].isin(fi)]
-        if fu and "UF"       in df.columns:  dff = dff[dff["UF"].isin(fu)]
-        if fa and "Analista" in df.columns:  dff = dff[dff["Analista"].isin(fa)]
-        if fc:                               dff = dff[dff["Conta"].isin(fc)]
-
-        prio = ["Ticket#","UF","Cidade","Escola","INEP","Analista","Status Rede","Plataforma",
-                "Uptime WAN","ISP","Conta","IP Externo","Nome no Console","Dias Abertos (Corridos)"]
-        cols = [c for c in prio if c in dff.columns] + [c for c in dff.columns if c not in prio]
-
-        st.dataframe(dff[cols].style.map(cor_status, subset=["Status Rede"]),
-                     use_container_width=True, height=500)
-        st.caption(f"{len(dff):,} de {len(df):,} chamados exibidos")
-
-        ca, cb, _ = st.columns([1, 1, 3])
-        ca.download_button("⬇️ Exportar filtrado", to_xlsx(dff[cols]),
-            f"chamados_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        cb.download_button("⬇️ Exportar completo", to_xlsx(df[cols]),
-            f"chamados_completo_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-# ─────────────────────────────────────────
-# ABA 3 — INVENTÁRIO GERAL
-# ─────────────────────────────────────────
-with t3:
     st.markdown("### 🌐 Inventário Geral de Escolas")
     st.write(
         "Coleta **todas** as escolas de todas as plataformas, independente de chamados abertos. "
@@ -1150,9 +1077,9 @@ with t3:
         st.info("Clique em **Coletar Inventário Completo** para carregar todas as escolas.")
 
 # ─────────────────────────────────────────
-# ABA 4 — PROVEDORES
+# ABA 3 — PROVEDORES
 # ─────────────────────────────────────────
-with t4:
+with t3:
     st.markdown("### Cadastro de Provedores (ISPs)")
     st.write(
         "ISPs detectados via API Ubiquiti são adicionados automaticamente a cada importação. "
@@ -1217,9 +1144,9 @@ with t4:
         st.rerun()
 
 # ─────────────────────────────────────────
-# ABA 5 — BUSCA MANUAL
+# ABA 4 — BUSCA MANUAL
 # ─────────────────────────────────────────
-with t5:
+with t4:
     st.markdown("#### INEPs para consulta")
     col_txt, col_how = st.columns([2, 1])
     with col_txt:
@@ -1321,9 +1248,9 @@ with t5:
                 st.error("Nenhum INEP localizado em nenhuma das fontes consultadas.")
 
 # ─────────────────────────────────────────
-# ABA 6 — RAIO-X
+# ABA 5 — RAIO-X
 # ─────────────────────────────────────────
-with t6:
+with t5:
     if not alvo:
         st.warning("Selecione pelo menos uma conta na barra lateral.")
     else:
@@ -1359,9 +1286,9 @@ with t6:
                 st.info("Selecione uma conta e clique em 'Sondar'.")
 
 # ─────────────────────────────────────────
-# ABA 7 — DIAGNÓSTICO
+# ABA 6 — DIAGNÓSTICO
 # ─────────────────────────────────────────
-with t7:
+with t6:
     if not alvo:
         st.warning("Selecione pelo menos uma conta na barra lateral.")
     else:
@@ -1391,17 +1318,17 @@ with t7:
             st.rerun()
 
 # ─────────────────────────────────────────
-# ABA 8 — AJUDA
+# ABA 7 — AJUDA
 # ─────────────────────────────────────────
-with t8:
+with t7:
     st.markdown("### Como usar o Hub Redes — EACE")
     st.markdown("""
-**Fluxo principal (chamados):**
-1. Configure as contas Ubiquiti na barra lateral
-2. Faça upload da planilha de chamados (.xlsx com coluna INEP)
-3. Opcionalmente, faça upload dos exports do Omada e/ou Zyxel
-4. Clique em **Iniciar Consulta em Massa**
-5. Acesse **Chamados** para filtrar e exportar
+**Relatório Diário:**
+1. Acesse **Área Restrita > Fechamento Diário** na barra lateral
+2. Informe a senha da área restrita
+3. Preencha os dados operacionais do dia e envie a planilha .xlsx
+4. Clique em **Concluir Fechamento**
+5. Acesse **Relatório Diário** para visualizar e baixar o relatório
 
 **Inventário Geral:**
 - Coleta TODAS as escolas de todas as plataformas, sem depender de chamados

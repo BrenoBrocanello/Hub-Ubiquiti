@@ -5,3 +5,4 @@ __pycache__/
 *.xlsx
 *.csv
 .env
+data/fechamentos_diarios/
