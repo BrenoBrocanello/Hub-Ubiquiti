@@ -512,7 +512,7 @@ def extrair_host(host: dict) -> dict:
     nome   = str(rep.get("name", host.get("name", ""))).strip()
     estado = str(rep.get("state", "disconnected")).lower()
     ip     = str(host.get("ipAddress", rep.get("ip", "—"))).strip()
-    ultimo_sinal = extrair_ultimo_sinal(host, rep)
+    ultimo_sinal = extrair_ultimo_sinal(host, rep) if estado != "connected" else "—"
     isp    = "—"
     wans   = rep.get("wans", [])
     if isinstance(wans, list) and wans and isinstance(wans[0], dict):
