@@ -777,6 +777,101 @@ def to_xlsx(df: pd.DataFrame) -> bytes:
         df.to_excel(w, index=False, sheet_name="Resultado")
     return buf.getvalue()
 
+
+def _extrair_uf(nome: str) -> str:
+    m = re.match(r"^([A-Z]{2})\s", str(nome).strip().upper())
+    return m.group(1) if m else "??"
+
+
+@st.cache_data(show_spinner=False)
+def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
+    """
+    Gera o Excel multi-aba no formato padrão do inventário:
+      ESTATISTICAS | Geral | Escolas não encontradas dash´s | {conta}...
+    Status simplificado para Online/Offline.
+    Colunas: INEP, Nome no Console, Status, Conta.
+    """
+    df = df_inv.copy()
+
+    # Simplifica status
+    if "Status Rede" in df.columns:
+        df["Status"] = df["Status Rede"].apply(
+            lambda x: "Online" if "ONLINE" in str(x).upper() else "Offline"
+        )
+    elif "Status" not in df.columns:
+        df["Status"] = "Offline"
+
+    df["INEP"] = df["INEP"].astype(str).str.strip()
+    _cols_querer = ["INEP", "Nome no Console", "Status", "Conta"]
+    col_base = [c for c in _cols_querer if c in df.columns]  # só colunas que existem
+    df = df[col_base].copy()
+
+    # Carrega lista de referência de INEPs não encontrados
+    ineps_ref: set = set()
+    if os.path.exists("data/lista_ineps_referencia.xlsx"):
+        try:
+            _dr = pd.read_excel("data/lista_ineps_referencia.xlsx", dtype=str)
+            _col = next((c for c in _dr.columns if "INEP" in c.upper()), _dr.columns[0])
+            ineps_ref = set(_dr[_col].dropna().astype(str).str.strip())
+        except Exception:
+            pass
+
+    ineps_encontrados = set(df[df["INEP"] != "—"]["INEP"].unique())
+    nao_enc = sorted(ineps_ref - ineps_encontrados)
+    df_nao_enc = pd.DataFrame({"Ordem": range(1, len(nao_enc) + 1), "INEP": nao_enc})
+
+    # Totais
+    validos = df[df["INEP"] != "—"]
+    total   = len(validos)
+    online  = (validos["Status"] == "Online").sum() if "Status" in validos.columns else 0
+    offline = (validos["Status"] == "Offline").sum() if "Status" in validos.columns else 0
+
+    # Por UF
+    if not validos.empty and "Nome no Console" in validos.columns:
+        _uf_s = validos["Nome no Console"].apply(_extrair_uf)
+        por_uf = (validos.assign(_uf=_uf_s)
+                  .groupby("_uf")
+                  .agg(Total=("INEP", "count"),
+                       _on=("Status", lambda x: (x == "Online").sum()),
+                       _off=("Status", lambda x: (x == "Offline").sum()))
+                  .reset_index()
+                  .rename(columns={"_uf": "UF", "_on": "Online", "_off": "Offline"})
+                  .sort_values("Total", ascending=False))
+    else:
+        por_uf = pd.DataFrame(columns=["UF", "Total", "Online", "Offline"])
+
+    stats = [
+        {"Indicador": "Total de escolas no inventário",  "Valor": total},
+        {"Indicador": "Online",                          "Valor": int(online)},
+        {"Indicador": "Offline",                         "Valor": int(offline)},
+        {"Indicador": "Percentual online",               "Valor": f"{online/total*100:.2f}%" if total else "—"},
+        {"Indicador": "Não encontradas em nenhum dash",  "Valor": len(nao_enc)},
+        {"Indicador": "",                                "Valor": ""},
+        {"Indicador": "=== Resumo por UF ===",           "Valor": ""},
+    ]
+    for _, r in por_uf.iterrows():
+        pct = f"{r['Online']/r['Total']*100:.2f}%" if r["Total"] else "—"
+        stats.append({
+            "Indicador": f"{r['UF']}: {r['Total']} escolas  |  Online: {r['Online']}  |  Offline: {r['Offline']}  |  {pct}",
+            "Valor": "",
+        })
+    df_stats = pd.DataFrame(stats)
+
+    # Ordem de contas
+    contas_ordem = sorted(df["Conta"].dropna().unique().tolist()) if "Conta" in df.columns else []
+
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df_stats.to_excel(w, index=False, sheet_name="ESTATISTICAS")
+        df.to_excel(w, index=False, sheet_name="Geral")
+        df_nao_enc.to_excel(w, index=False, sheet_name="Escolas não encontradas dash´s")
+        for conta in contas_ordem:
+            df_c = df[df["Conta"] == conta]
+            sname = re.sub(r'[\\/*?:\[\]]', "_", conta)[:31]
+            df_c.to_excel(w, index=False, sheet_name=sname)
+
+    return buf.getvalue()
+
 def deduplicar_por_inep(todos: dict) -> dict:
     """
     Recebe dict {inep: dados} já montado e garante que cada INEP
@@ -912,8 +1007,8 @@ t1, t2, t3, t4, t5, t6 = st.tabs([
     "📄 Relatório Diário",
     "🌐 Inventário Geral",
     "🔍 Busca Manual",
-    "🛠️ Raio-X da Conta",
-    "🩺 Diagnóstico",
+    "🛠️ Dados das contas",
+    "🩺 Diagnóstico das API´S",
     "ℹ️ Ajuda",
 ])
 
@@ -1111,19 +1206,22 @@ with t2:
 
         ce1, ce2, _ = st.columns([1, 1, 3])
         ce1.download_button(
-            "⬇️ Exportar filtrado",
-            to_xlsx(df_inv_f),
-            f"inventario_filtrado_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            "⬇️ Exportar inventário completo",
+            gerar_excel_inventario_formatado(df_inv),
+            f"inventario_{datetime.now().strftime('%Y-%m-%d')}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Planilha formatada: ESTATISTICAS, Geral, Escolas não encontradas, por conta."
         )
         ce2.download_button(
-            "⬇️ Exportar completo",
-            to_xlsx(df_inv),
-            f"inventario_completo_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            "⬇️ Exportar visualização atual",
+            to_xlsx(df_inv_f),
+            f"inventario_filtrado_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Exporta somente o que está visível na tabela (com filtros aplicados)."
         )
     else:
         st.info("Clique em **Coletar Inventário Completo** para carregar todas as escolas.")
+
 
 # ─────────────────────────────────────────
 # ABA 3 — BUSCA MANUAL

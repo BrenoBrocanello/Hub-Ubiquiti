@@ -3,6 +3,7 @@ secrets.toml
 config_provedores.json
 __pycache__/
 *.xlsx
+!data/lista_ineps_referencia.xlsx
 *.csv
 .env
 data/fechamentos_diarios/
