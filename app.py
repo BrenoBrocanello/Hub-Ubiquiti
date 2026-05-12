@@ -802,7 +802,15 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
         df["Status"] = "Offline"
 
     df["INEP"] = df["INEP"].astype(str).str.strip()
-    _cols_querer = ["INEP", "Nome no Console", "Status", "Conta"]
+
+    # Coluna FASE: 4.2 para Omada/Zyxel, vazio para Ubiquiti
+    _contas_fase42 = {"Omada Cloud", "Zyxel Nebula"}
+    if "Conta" in df.columns:
+        df["FASE"] = df["Conta"].apply(lambda c: "4.2" if c in _contas_fase42 else "")
+    else:
+        df["FASE"] = ""
+
+    _cols_querer = ["INEP", "Nome no Console", "Status", "Conta", "FASE"]
     col_base = [c for c in _cols_querer if c in df.columns]  # só colunas que existem
     df = df[col_base].copy()
 
@@ -857,8 +865,11 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
         })
     df_stats = pd.DataFrame(stats)
 
-    # Ordem de contas
+    # Ordem de contas (Ubiquiti primeiro, depois Omada/Zyxel)
     contas_ordem = sorted(df["Conta"].dropna().unique().tolist()) if "Conta" in df.columns else []
+
+    # Aba 4.2: Omada + Zyxel
+    df_fase42 = df[df["FASE"] == "4.2"].copy() if "FASE" in df.columns else pd.DataFrame(columns=col_base)
 
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
@@ -869,6 +880,7 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
             df_c = df[df["Conta"] == conta]
             sname = re.sub(r'[\\/*?:\[\]]', "_", conta)[:31]
             df_c.to_excel(w, index=False, sheet_name=sname)
+        df_fase42.to_excel(w, index=False, sheet_name="4.2")
 
     return buf.getvalue()
 
