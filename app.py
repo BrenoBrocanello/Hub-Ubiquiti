@@ -6,8 +6,9 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
+from zoneinfo import ZoneInfo
 
 from modules.daily_report import render_daily_closing_admin, render_daily_report
 
@@ -17,6 +18,8 @@ from modules.daily_report import render_daily_closing_admin, render_daily_report
 CONFIG_FILE       = "config_contas.json"
 CONFIG_PROVEDORES = "config_provedores.json"
 BASE_URL          = "https://api.ui.com/v1"
+APP_TZ            = ZoneInfo("America/Sao_Paulo")
+LAST_SEEN_COLUMN  = "Último Sinal"
 
 st.set_page_config(
     page_title="Hub Redes — EACE",
@@ -438,6 +441,49 @@ for k, v in {
 # ═══════════════════════════════════════════════════════════════
 # API UBIQUITI
 # ═══════════════════════════════════════════════════════════════
+def formatar_timestamp_api(valor) -> str:
+    if valor in (None, "", "—"):
+        return "—"
+    try:
+        if isinstance(valor, (int, float)):
+            ts = float(valor)
+            if ts > 10_000_000_000:
+                ts = ts / 1000
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        else:
+            texto = str(valor).strip()
+            if not texto:
+                return "—"
+            if re.fullmatch(r"\d+(\.\d+)?", texto):
+                ts = float(texto)
+                if ts > 10_000_000_000:
+                    ts = ts / 1000
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            else:
+                dt = datetime.fromisoformat(texto.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(APP_TZ).strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return str(valor).strip() or "—"
+
+def extrair_ultimo_sinal(host: dict, rep: dict) -> str:
+    candidatos = [
+        host.get("lastConnectionStateChange"),
+        rep.get("deviceStateLastChanged"),
+        host.get("latestBackupTime"),
+    ]
+    grupos = host.get("userData", {}).get("consoleGroupMembers", [])
+    if isinstance(grupos, list):
+        for grupo in grupos:
+            attrs = grupo.get("roleAttributes", {}) if isinstance(grupo, dict) else {}
+            candidatos.append(attrs.get("connectedStateLastChanged"))
+    for valor in candidatos:
+        formatado = formatar_timestamp_api(valor)
+        if formatado != "—":
+            return formatado
+    return "—"
+
 def get_paginated_hosts(api_key: str) -> list:
     items, next_token = [], None
     while True:
@@ -466,6 +512,7 @@ def extrair_host(host: dict) -> dict:
     nome   = str(rep.get("name", host.get("name", ""))).strip()
     estado = str(rep.get("state", "disconnected")).lower()
     ip     = str(host.get("ipAddress", rep.get("ip", "—"))).strip()
+    ultimo_sinal = extrair_ultimo_sinal(host, rep)
     isp    = "—"
     wans   = rep.get("wans", [])
     if isinstance(wans, list) and wans and isinstance(wans[0], dict):
@@ -476,7 +523,7 @@ def extrair_host(host: dict) -> dict:
         last = periods[-1]
         if isinstance(last, dict) and last.get("wanUptime") is not None:
             uptime = f"{last['wanUptime']:.1f}%"
-    return {"nome": nome, "estado": estado, "ip": ip, "isp": isp, "uptime": uptime}
+    return {"nome": nome, "estado": estado, "ip": ip, "isp": isp, "uptime": uptime, "ultimo_sinal": ultimo_sinal}
 
 def buscar_ineps_ubiquiti(api_key: str, apelido: str, ineps: set) -> dict:
     out   = {}
@@ -490,6 +537,7 @@ def buscar_ineps_ubiquiti(api_key: str, apelido: str, ineps: set) -> dict:
                 out[str(inep).strip()] = {
                     "Status Rede":     f"UBIQUITI - {status_raw}",
                     "Plataforma":      "UBIQUITI",
+                    LAST_SEEN_COLUMN:   d["ultimo_sinal"],
                     "Uptime WAN":      d["uptime"],
                     "ISP":             d["isp"],
                     "Conta":           apelido,
@@ -517,6 +565,7 @@ def coletar_todos_hosts_ubiquiti(contas: list) -> tuple:
                     "Nome no Console": d["nome"],
                     "Status Rede":     f"UBIQUITI - {status}",
                     "Plataforma":      "UBIQUITI",
+                    LAST_SEEN_COLUMN:   d["ultimo_sinal"],
                     "Uptime WAN":      d["uptime"],
                     "ISP":             d["isp"],
                     "Conta":           c["apelido"],
@@ -582,6 +631,7 @@ def processar_export_omada(df_omada: pd.DataFrame) -> dict:
         resultado[inep] = {
             "Status Rede":     f"OMADA - {status_raw}",
             "Plataforma":      "OMADA",
+            LAST_SEEN_COLUMN:   "—",
             "Uptime WAN":      "—",
             "ISP":             "—",
             "Conta":           "Omada Cloud",
@@ -610,6 +660,7 @@ def processar_export_omada_completo(df_omada: pd.DataFrame) -> list:
             "Nome no Console": nome,
             "Status Rede":     f"OMADA - {status_raw}",
             "Plataforma":      "OMADA",
+            LAST_SEEN_COLUMN:   "—",
             "Uptime WAN":      "—",
             "ISP":             "—",
             "Conta":           "Omada Cloud",
@@ -652,6 +703,7 @@ def processar_export_zyxel(df_zyxel: pd.DataFrame) -> dict:
         resultado[inep] = {
             "Status Rede":       f"ZYXEL - {status_interno}",
             "Plataforma":        "ZYXEL",
+            LAST_SEEN_COLUMN:     "—",
             "Uptime WAN":        f"{pct_offline} offline" if pct_offline != "—" else "—",
             "ISP":               "—",
             "Conta":             "Zyxel Nebula",
@@ -687,6 +739,7 @@ def processar_export_zyxel_completo(df_zyxel: pd.DataFrame) -> list:
             "Nome no Console":   nome,
             "Status Rede":       f"ZYXEL - {status_interno}",
             "Plataforma":        "ZYXEL",
+            LAST_SEEN_COLUMN:     "—",
             "Uptime WAN":        f"{pct_offline} offline" if pct_offline != "—" else "—",
             "ISP":               "—",
             "Conta":             "Zyxel Nebula",
@@ -965,7 +1018,7 @@ with t2:
 
                     # Garante ordem das colunas
                     col_order = ["INEP","Nome no Console","Status Rede","Plataforma",
-                                 "Uptime WAN","ISP","Conta","IP Externo"]
+                                 LAST_SEEN_COLUMN,"Uptime WAN","ISP","Conta","IP Externo"]
                     df_inv = df_inv[[c for c in col_order if c in df_inv.columns] +
                                     [c for c in df_inv.columns if c not in col_order]]
                     st.session_state.df_inventario     = df_inv
@@ -1194,9 +1247,17 @@ with t4:
                 with st.spinner(f"Carregando hosts de '{conta_rx}'..."):
                     try:
                         hosts = get_paginated_hosts(key_rx)
-                        rows  = [{"Nome": extrair_host(h)["nome"], "Estado": extrair_host(h)["estado"],
-                                  "IP": extrair_host(h)["ip"], "ISP": extrair_host(h)["isp"],
-                                  "Uptime": extrair_host(h)["uptime"]} for h in hosts]
+                        rows  = []
+                        for h in hosts:
+                            d = extrair_host(h)
+                            rows.append({
+                                "Nome": d["nome"],
+                                "Estado": d["estado"],
+                                LAST_SEEN_COLUMN: d["ultimo_sinal"],
+                                "IP": d["ip"],
+                                "ISP": d["isp"],
+                                "Uptime": d["uptime"],
+                            })
                         df_rx = pd.DataFrame(rows)
                         if filtro:
                             df_rx = df_rx[df_rx["Nome"].str.upper().str.contains(filtro.upper(), na=False)]
