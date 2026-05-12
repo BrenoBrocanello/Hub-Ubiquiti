@@ -785,15 +785,64 @@ def _extrair_uf(nome: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
-    """
-    Gera o Excel multi-aba no formato padrão do inventário:
-      ESTATISTICAS | Geral | Escolas não encontradas dash´s | {conta}...
-    Status simplificado para Online/Offline.
-    Colunas: INEP, Nome no Console, Status, Conta.
-    """
-    df = df_inv.copy()
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
 
-    # Simplifica status
+    # ── Paleta de cores ──────────────────────────────────────────
+    NAVY    = "1F4E79"
+    BLUE    = "2E75B6"
+    PURPLE  = "7030A0"
+    RED_HDR = "C00000"
+    WHITE   = "FFFFFF"
+    GRN_BG  = "E2EFDA"; GRN_FG = "375623"
+    RED_BG  = "FCE4D6"; RED_FG = "C00000"
+    ORG_BG  = "FFF2CC"; ORG_FG = "7F6000"
+    BLU_BG  = "DEEAF1"
+    GRAY    = "F2F2F2"
+    BD      = "BFBFBF"
+
+    def _side():   return Side(style="thin", color=BD)
+    def _border(): return Border(left=_side(), right=_side(), top=_side(), bottom=_side())
+
+    def _cell(ws, row, col, value=None, bg=None, fg="000000", bold=False,
+              size=10, align="left", italic=False, border=True):
+        c = ws.cell(row=row, column=col)
+        if value is not None:
+            c.value = value
+        c.font = Font(name="Calibri", size=size, color=fg, bold=bold, italic=italic)
+        c.alignment = Alignment(horizontal=align, vertical="center", wrap_text=False)
+        if bg:
+            c.fill = PatternFill("solid", fgColor=bg)
+        if border:
+            c.border = _border()
+        return c
+
+    def _hdr(ws, row, col, value, bg=NAVY):
+        return _cell(ws, row, col, value, bg=bg, fg=WHITE, bold=True,
+                     size=11, align="center")
+
+    def _title(ws, row, n_cols, text, bg=NAVY, size=14, height=38):
+        _cell(ws, row, 1, text, bg=bg, fg=WHITE, bold=True,
+              size=size, align="center", border=False)
+        if n_cols > 1:
+            ws.merge_cells(start_row=row, start_column=1,
+                           end_row=row, end_column=n_cols)
+        ws.row_dimensions[row].height = height
+
+    def _merge_row(ws, row, col_start, col_end):
+        if col_end > col_start:
+            ws.merge_cells(start_row=row, start_column=col_start,
+                           end_row=row, end_column=col_end)
+
+    def _auto_width(ws, min_w=10, max_w=55):
+        for col in ws.columns:
+            letter = get_column_letter(col[0].column)
+            width = max((len(str(c.value or "")) for c in col), default=0)
+            ws.column_dimensions[letter].width = min(max(width + 3, min_w), max_w)
+
+    # ── Preparar dados ───────────────────────────────────────────
+    df = df_inv.copy()
     if "Status Rede" in df.columns:
         df["Status"] = df["Status Rede"].apply(
             lambda x: "Online" if "ONLINE" in str(x).upper() else "Offline"
@@ -802,86 +851,195 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
         df["Status"] = "Offline"
 
     df["INEP"] = df["INEP"].astype(str).str.strip()
+    _f42 = {"Omada Cloud", "Zyxel Nebula"}
+    df["FASE"] = df["Conta"].apply(lambda c: "4.2" if c in _f42 else "") \
+        if "Conta" in df.columns else ""
 
-    # Coluna FASE: 4.2 para Omada/Zyxel, vazio para Ubiquiti
-    _contas_fase42 = {"Omada Cloud", "Zyxel Nebula"}
-    if "Conta" in df.columns:
-        df["FASE"] = df["Conta"].apply(lambda c: "4.2" if c in _contas_fase42 else "")
-    else:
-        df["FASE"] = ""
+    col_base = [c for c in ["INEP", "Nome no Console", "Status", "Conta", "FASE"]
+                if c in df.columns]
+    df = df[col_base].fillna("").copy()
 
-    _cols_querer = ["INEP", "Nome no Console", "Status", "Conta", "FASE"]
-    col_base = [c for c in _cols_querer if c in df.columns]  # só colunas que existem
-    df = df[col_base].copy()
-
-    # Carrega lista de referência de INEPs não encontrados
+    # Referência
     ineps_ref: set = set()
     if os.path.exists("data/lista_ineps_referencia.xlsx"):
         try:
             _dr = pd.read_excel("data/lista_ineps_referencia.xlsx", dtype=str)
-            _col = next((c for c in _dr.columns if "INEP" in c.upper()), _dr.columns[0])
-            ineps_ref = set(_dr[_col].dropna().astype(str).str.strip())
+            _ci = next((c for c in _dr.columns if "INEP" in c.upper()), _dr.columns[0])
+            ineps_ref = set(_dr[_ci].dropna().astype(str).str.strip())
         except Exception:
             pass
 
-    ineps_encontrados = set(df[df["INEP"] != "—"]["INEP"].unique())
-    nao_enc = sorted(ineps_ref - ineps_encontrados)
-    df_nao_enc = pd.DataFrame({"Ordem": range(1, len(nao_enc) + 1), "INEP": nao_enc})
+    ineps_enc = set(df[df["INEP"] != "—"]["INEP"].unique())
+    nao_enc   = sorted(ineps_ref - ineps_enc)
+    df_nao    = pd.DataFrame({"Ordem": range(1, len(nao_enc)+1), "INEP": nao_enc})
 
-    # Totais
     validos = df[df["INEP"] != "—"]
     total   = len(validos)
-    online  = (validos["Status"] == "Online").sum() if "Status" in validos.columns else 0
-    offline = (validos["Status"] == "Offline").sum() if "Status" in validos.columns else 0
+    online  = int((validos["Status"] == "Online").sum())  if "Status" in validos.columns else 0
+    offline = int((validos["Status"] == "Offline").sum()) if "Status" in validos.columns else 0
 
-    # Por UF
     if not validos.empty and "Nome no Console" in validos.columns:
         _uf_s = validos["Nome no Console"].apply(_extrair_uf)
         por_uf = (validos.assign(_uf=_uf_s)
                   .groupby("_uf")
-                  .agg(Total=("INEP", "count"),
-                       _on=("Status", lambda x: (x == "Online").sum()),
-                       _off=("Status", lambda x: (x == "Offline").sum()))
+                  .agg(Total=("INEP","count"),
+                       Onl=("Status", lambda x:(x=="Online").sum()),
+                       Off=("Status", lambda x:(x=="Offline").sum()))
                   .reset_index()
-                  .rename(columns={"_uf": "UF", "_on": "Online", "_off": "Offline"})
+                  .rename(columns={"_uf":"UF","Onl":"Online","Off":"Offline"})
                   .sort_values("Total", ascending=False))
     else:
-        por_uf = pd.DataFrame(columns=["UF", "Total", "Online", "Offline"])
+        por_uf = pd.DataFrame(columns=["UF","Total","Online","Offline"])
 
-    stats = [
-        {"Indicador": "Total de escolas no inventário",  "Valor": total},
-        {"Indicador": "Online",                          "Valor": int(online)},
-        {"Indicador": "Offline",                         "Valor": int(offline)},
-        {"Indicador": "Percentual online",               "Valor": f"{online/total*100:.2f}%" if total else "—"},
-        {"Indicador": "Não encontradas em nenhum dash",  "Valor": len(nao_enc)},
-        {"Indicador": "",                                "Valor": ""},
-        {"Indicador": "=== Resumo por UF ===",           "Valor": ""},
+    contas_ordem = sorted(df["Conta"].dropna().unique().tolist()) \
+        if "Conta" in df.columns else []
+    df_42 = df[df["FASE"] == "4.2"].copy() if "FASE" in df.columns \
+        else pd.DataFrame(columns=col_base)
+
+    # ── Workbook ─────────────────────────────────────────────────
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    # ════════════════════════════════════════════════════════════
+    # ABA: ESTATISTICAS
+    # ════════════════════════════════════════════════════════════
+    ws = wb.create_sheet("ESTATISTICAS")
+    ws.sheet_view.showGridLines = False
+    NC = 5  # colunas A–E
+
+    # Linha 1 — título principal
+    _title(ws, 1, NC, "INVENTÁRIO GERAL DE ESCOLAS — EACE", bg=NAVY, size=16, height=44)
+
+    # Linha 2 — data
+    _cell(ws, 2, 1,
+          f"Gerado em {datetime.now(APP_TZ).strftime('%d/%m/%Y às %H:%M')} (Brasília)",
+          fg="595959", italic=True, align="center", border=False)
+    _merge_row(ws, 2, 1, NC)
+    ws.row_dimensions[2].height = 18
+
+    ws.row_dimensions[3].height = 10  # espaçador
+
+    # Linha 4 — cabeçalho da seção KPI
+    _title(ws, 4, NC, "INDICADORES GERAIS", bg=BLUE, size=12, height=26)
+
+    # Linha 5 — colunas da tabela KPI
+    _hdr(ws, 5, 1, "INDICADOR", bg=NAVY)
+    _hdr(ws, 5, 2, "VALOR",     bg=NAVY)
+    _merge_row(ws, 5, 2, NC)
+    ws.row_dimensions[5].height = 22
+
+    # Linhas 6–10 — KPIs
+    kpis = [
+        ("Total de escolas no inventário",        total,   BLU_BG, "000000"),
+        ("Online",                                 online,  GRN_BG, GRN_FG),
+        ("Offline",                                offline, RED_BG, RED_FG),
+        ("Percentual online",
+         f"{online/total*100:.2f}%" if total else "—",
+         GRN_BG if (total and online/total >= .5) else RED_BG, "000000"),
+        ("Não encontradas em nenhum dashboard",   len(nao_enc), ORG_BG, ORG_FG),
     ]
-    for _, r in por_uf.iterrows():
-        pct = f"{r['Online']/r['Total']*100:.2f}%" if r["Total"] else "—"
-        stats.append({
-            "Indicador": f"{r['UF']}: {r['Total']} escolas  |  Online: {r['Online']}  |  Offline: {r['Offline']}  |  {pct}",
-            "Valor": "",
-        })
-    df_stats = pd.DataFrame(stats)
+    for i, (label, val, bg, fg) in enumerate(kpis):
+        r = 6 + i
+        _cell(ws, r, 1, label, bg=bg, fg=fg, size=11)
+        _cell(ws, r, 2, val,   bg=bg, fg=fg, size=12, bold=True, align="center")
+        _merge_row(ws, r, 2, NC)
+        ws.row_dimensions[r].height = 24
 
-    # Ordem de contas (Ubiquiti primeiro, depois Omada/Zyxel)
-    contas_ordem = sorted(df["Conta"].dropna().unique().tolist()) if "Conta" in df.columns else []
+    ws.row_dimensions[11].height = 12  # espaçador
 
-    # Aba 4.2: Omada + Zyxel
-    df_fase42 = df[df["FASE"] == "4.2"].copy() if "FASE" in df.columns else pd.DataFrame(columns=col_base)
+    # Linha 12 — cabeçalho UF
+    _title(ws, 12, NC, "RESUMO POR ESTADO (UF)", bg=NAVY, size=12, height=28)
+
+    # Linha 13 — colunas UF
+    for ci, h in enumerate(["UF", "Total", "Online", "Offline", "% Online"], 1):
+        _hdr(ws, 13, ci, h, bg=BLUE)
+    ws.row_dimensions[13].height = 22
+
+    # Linhas 14+ — dados UF
+    for i, (_, r) in enumerate(por_uf.iterrows()):
+        ri = 14 + i
+        pct = f"{r['Online']/r['Total']*100:.1f}%" if r["Total"] else "—"
+        bg_row = GRAY if i % 2 == 0 else WHITE
+        for ci, v in enumerate([r["UF"], int(r["Total"]), int(r["Online"]),
+                                 int(r["Offline"]), pct], 1):
+            _cell(ws, ri, ci, v, bg=bg_row, align="center")
+        ws.row_dimensions[ri].height = 18
+
+    ws.column_dimensions["A"].width = 40
+    for letter in ["B","C","D","E"]:
+        ws.column_dimensions[letter].width = 14
+
+    # ════════════════════════════════════════════════════════════
+    # Helper — criar aba de dados com formatação completa
+    # ════════════════════════════════════════════════════════════
+    def criar_aba(nome, df_data, titulo, bg_titulo=NAVY):
+        ws2 = wb.create_sheet(nome)
+        ws2.sheet_view.showGridLines = False
+
+        cols = list(df_data.columns)
+        nc   = len(cols) or 1
+
+        # Linha 1 — título
+        _title(ws2, 1, nc, titulo, bg=bg_titulo, size=13, height=36)
+
+        if df_data.empty:
+            _cell(ws2, 2, 1, "Sem dados disponíveis.", italic=True,
+                  fg="595959", border=False)
+            ws2.column_dimensions["A"].width = 40
+            return
+
+        # Linha 2 — cabeçalhos
+        CENTRAR = {"INEP", "Status", "Conta", "FASE", "Ordem"}
+        for ci, col_name in enumerate(cols, 1):
+            _hdr(ws2, 2, ci, col_name, bg=NAVY)
+        ws2.row_dimensions[2].height = 26
+
+        # Linhas 3+ — dados
+        for i, (_, row_data) in enumerate(df_data.iterrows()):
+            ri     = i + 3
+            status = str(row_data.get("Status", "")).strip()
+
+            if status == "Online":
+                bg_row, fg_row = GRN_BG, GRN_FG
+            elif status == "Offline":
+                bg_row, fg_row = RED_BG, RED_FG
+            else:
+                bg_row = GRAY if i % 2 == 0 else WHITE
+                fg_row = "000000"
+
+            for ci, col_name in enumerate(cols, 1):
+                val = row_data.get(col_name, "")
+                if pd.isnull(val):
+                    val = ""
+                _cell(ws2, ri, ci, val, bg=bg_row, fg=fg_row,
+                      align="center" if col_name in CENTRAR else "left")
+
+            ws2.row_dimensions[ri].height = 18
+
+        # Freeze após título + cabeçalho; filtro automático
+        ws2.freeze_panes = "A3"
+        ws2.auto_filter.ref = f"A2:{get_column_letter(nc)}2"
+        _auto_width(ws2)
+
+    # ── Criar todas as abas ──────────────────────────────────────
+    criar_aba("Geral", df,
+              "INVENTÁRIO GERAL — TODAS AS PLATAFORMAS")
+
+    criar_aba("Escolas não encontradas dash´s", df_nao,
+              f"ESCOLAS NÃO ENCONTRADAS EM NENHUM DASHBOARD  ({len(nao_enc)} INEPs)",
+              bg_titulo=RED_HDR)
+
+    for conta in contas_ordem:
+        df_c  = df[df["Conta"] == conta].copy()
+        sname = re.sub(r'[\\/*?:\[\]]', "_", conta)[:31]
+        bg    = PURPLE if conta in _f42 else NAVY
+        criar_aba(sname, df_c, f"ESCOLAS — {conta.upper()}", bg_titulo=bg)
+
+    criar_aba("4.2", df_42,
+              "FASE 4.2 — OMADA + ZYXEL", bg_titulo=PURPLE)
 
     buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        df_stats.to_excel(w, index=False, sheet_name="ESTATISTICAS")
-        df.to_excel(w, index=False, sheet_name="Geral")
-        df_nao_enc.to_excel(w, index=False, sheet_name="Escolas não encontradas dash´s")
-        for conta in contas_ordem:
-            df_c = df[df["Conta"] == conta]
-            sname = re.sub(r'[\\/*?:\[\]]', "_", conta)[:31]
-            df_c.to_excel(w, index=False, sheet_name=sname)
-        df_fase42.to_excel(w, index=False, sheet_name="4.2")
-
+    wb.save(buf)
     return buf.getvalue()
 
 def deduplicar_por_inep(todos: dict) -> dict:
