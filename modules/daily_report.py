@@ -576,7 +576,7 @@ def generate_daily_report_pdf(closing: dict) -> bytes:
     report_date = closing.get("report_date_display", closing.get("report_date", ""))
     metadata = [
         ["Data do relatório", report_date, "Responsável", closing.get("responsible", "Não informado")],
-        ["Fonte", closing.get("source_file", "planilha.xlsx"), "Gerado em", datetime.now().strftime("%d/%m/%Y %H:%M")],
+        ["Fonte", closing.get("source_file", "planilha.xlsx"), "Gerado em", datetime.now().strftime("%d/%m/%Y")],
     ]
     story.append(_pdf_table(metadata, widths=[3.2 * cm, 6.0 * cm, 3.0 * cm, 6.0 * cm], header=False))
     story.append(Spacer(1, 10))
@@ -680,6 +680,320 @@ def generate_daily_report_pdf(closing: dict) -> bytes:
 
     doc.build(story, onFirstPage=footer, onLaterPages=footer)
     return buffer.getvalue()
+
+
+def generate_daily_report_excel(closing: dict) -> bytes:
+    from io import BytesIO
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils.cell import range_boundaries
+
+    colors = {
+        "navy": "1F3864",
+        "blue": "2E75B6",
+        "red": "C00000",
+        "light_red": "FFCCCC",
+        "light_orange": "FDEBD0",
+        "light_yellow": "FFFACD",
+        "light_blue": "D6E4F0",
+        "light_green": "E2EFDA",
+        "next_blue": "BDD7EE",
+        "white": "FFFFFF",
+        "black": "000000",
+    }
+    thin = Side(style="thin", color="A6A6A6")
+    medium = Side(style="medium", color="1F3864")
+    thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    medium_border = Border(left=medium, right=medium, top=medium, bottom=medium)
+
+    def fill(name: str) -> PatternFill:
+        return PatternFill("solid", fgColor=colors[name])
+
+    def font(size=10, bold=False, color="black") -> Font:
+        return Font(name="Arial", size=size, bold=bold, color=colors[color])
+
+    def align(horizontal="center", vertical="center", wrap=False) -> Alignment:
+        return Alignment(horizontal=horizontal, vertical=vertical, wrap_text=wrap)
+
+    def style_cell(cell, *, fill_name=None, font_obj=None, alignment=None, border=None, number_format=None):
+        if fill_name:
+            cell.fill = fill(fill_name)
+        if font_obj:
+            cell.font = font_obj
+        if alignment:
+            cell.alignment = alignment
+        if border:
+            cell.border = border
+        if number_format:
+            cell.number_format = number_format
+
+    def style_range(ws, cell_range: str, *, fill_name=None, font_obj=None, alignment=None, border=None):
+        min_col, min_row, max_col, max_row = range_boundaries(cell_range)
+        for row in ws.iter_rows(min_row=min_row, max_row=max_row, min_col=min_col, max_col=max_col):
+            for cell in row:
+                style_cell(
+                    cell,
+                    fill_name=fill_name,
+                    font_obj=font_obj,
+                    alignment=alignment,
+                    border=border,
+                )
+
+    def merge_set(ws, cell_range: str, value, *, fill_name=None, font_obj=None, alignment=None, border=None):
+        style_range(ws, cell_range, fill_name=fill_name, font_obj=font_obj, alignment=alignment, border=border)
+        ws.merge_cells(cell_range)
+        top_left = ws[cell_range.split(":")[0]]
+        top_left.value = value
+
+    def safe_text(value: Any) -> str:
+        if value is None:
+            return ""
+        try:
+            if pd.isna(value):
+                return ""
+        except TypeError:
+            pass
+        return str(value)
+
+    def days_value(row: dict) -> int:
+        try:
+            return int(float(row.get("Dias em aberto", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def severity_fill(days: int, index: int) -> str:
+        if days > 100:
+            return "light_red"
+        if days > 60:
+            return "light_orange"
+        if days > 30:
+            return "light_yellow"
+        return "light_blue" if index % 2 == 0 else "white"
+
+    def percent_value(value: Any) -> float:
+        text = safe_text(value).replace("%", "").replace(",", ".").strip()
+        try:
+            number = float(text)
+        except ValueError:
+            return 0.0
+        return number / 100 if number > 1 else number
+
+    def prepare_sheet(ws, widths: dict[str, float]):
+        ws.sheet_view.showGridLines = False
+        for col, width in widths.items():
+            ws.column_dimensions[col].width = width
+        ws.page_margins.left = 0.75
+        ws.page_margins.right = 0.75
+        ws.page_margins.top = 1.0
+        ws.page_margins.bottom = 1.0
+
+    report_date = closing.get("report_date_display", closing.get("report_date", ""))
+    generated_date = datetime.now().strftime("%d/%m/%Y")
+    indicators = closing.get("indicators", {})
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Resumo Executivo"
+    prepare_sheet(
+        ws,
+        {"A": 3, "B": 22, "C": 18, "D": 13, "E": 13, "F": 13, "G": 13, "H": 13, "I": 13, "J": 13},
+    )
+    for row, height in {
+        1: 7.5, 2: 37.5, 3: 24, 4: 7.5, 5: 21.75, 6: 9.75, 7: 25.5,
+        8: 60, 9: 27.75, 10: 12, 11: 25.5, 12: 19.5,
+    }.items():
+        ws.row_dimensions[row].height = height
+
+    merge_set(ws, "B2:J2", "HUB REDES \u2013 EACE", fill_name="navy", font_obj=font(18, True, "white"), alignment=align())
+    merge_set(
+        ws,
+        "B3:J3",
+        "RELAT\u00d3RIO DI\u00c1RIO DE MONITORAMENTO \u2013 REDE EXTERNA",
+        fill_name="blue",
+        font_obj=font(12, True, "white"),
+        alignment=align(),
+    )
+    metadata = {
+        "B5": "Data do Relat\u00f3rio:", "C5": report_date,
+        "E5": "Respons\u00e1vel:", "F5": closing.get("responsible", "N\u00e3o informado"),
+        "H5": "Gerado em:", "I5": generated_date,
+    }
+    for coord, value in metadata.items():
+        ws[coord] = value
+        is_label = coord[0] in {"B", "E", "H"}
+        style_cell(
+            ws[coord],
+            font_obj=font(10, is_label, "navy" if is_label else "black"),
+            alignment=align("right" if is_label else "left"),
+        )
+
+    merge_set(ws, "B7:J7", "INDICADORES GERAIS", fill_name="navy", font_obj=font(11, True, "white"), alignment=align(), border=medium_border)
+    cards = [
+        ("B", "C", indicators.get("total_open", 0), "Total de Chamados em Aberto"),
+        ("D", "E", indicators.get("over_30", 0), "Chamados Acima de 30 Dias"),
+        ("F", "G", indicators.get("over_60", 0), "Chamados Acima de 60 Dias"),
+        ("H", "I", indicators.get("over_100", 0), "Chamados Acima de 100 Dias"),
+    ]
+    for start_col, end_col, value, label in cards:
+        merge_set(ws, f"{start_col}8:{end_col}8", value, fill_name="blue", font_obj=font(28, True, "white"), alignment=align(), border=medium_border)
+        merge_set(ws, f"{start_col}9:{end_col}9", label, fill_name="navy", font_obj=font(9, True, "white"), alignment=align(wrap=True), border=medium_border)
+
+    merge_set(ws, "B11:J11", "CHAMADOS MAIS CR\u00cdTICOS (TOP 15)", fill_name="navy", font_obj=font(11, True, "white"), alignment=align(), border=medium_border)
+    for coord, value in {"B12": "Ticket/OS", "C12": "INEP", "D12:F12": "Escola", "G12": "UF", "H12:I12": "Provedor", "J12": "Dias em Aberto"}.items():
+        if ":" in coord:
+            merge_set(ws, coord, value, fill_name="blue", font_obj=font(10, True, "white"), alignment=align(), border=thin_border)
+        else:
+            ws[coord] = value
+            style_cell(ws[coord], fill_name="blue", font_obj=font(10, True, "white"), alignment=align(), border=thin_border)
+
+    critical_df = pd.DataFrame(closing.get("critical_rows", []))
+    if critical_df.empty:
+        full_candidates = pd.DataFrame(closing.get("full_rows", []))
+        if not full_candidates.empty and "Dias em aberto" in full_candidates.columns:
+            critical_df = full_candidates.sort_values("Dias em aberto", ascending=False).head(15)
+        else:
+            critical_df = full_candidates.head(15)
+    for index in range(15):
+        row_num = 13 + index
+        ws.row_dimensions[row_num].height = 19.5
+        record = critical_df.iloc[index].to_dict() if index < len(critical_df) else {}
+        row_fill = severity_fill(days_value(record), index)
+        values = {
+            "B": safe_text(record.get("Ticket/OS")),
+            "C": safe_text(record.get("INEP")),
+            "D:F": safe_text(record.get("Escola")),
+            "G": safe_text(record.get("UF")),
+            "H:I": safe_text(record.get("Provedor")),
+            "J": days_value(record) if record else "",
+        }
+        for col_ref, value in values.items():
+            if ":" in col_ref:
+                merge_set(ws, f"{col_ref.split(':')[0]}{row_num}:{col_ref.split(':')[1]}{row_num}", value, fill_name=row_fill, font_obj=font(9), alignment=align("left", wrap=True), border=thin_border)
+            else:
+                ws[f"{col_ref}{row_num}"] = value
+                horizontal = "center" if col_ref in {"B", "C", "G", "J"} else "left"
+                style_cell(ws[f"{col_ref}{row_num}"], fill_name=row_fill, font_obj=font(9), alignment=align(horizontal, wrap=True), border=thin_border)
+
+    merge_set(ws, "B29:J29", "CHAMADOS POR PROVEDOR", fill_name="navy", font_obj=font(11, True, "white"), alignment=align(), border=medium_border)
+    provider_headers = {"B30:D30": "Provedor", "E30:F30": "Qtd. Chamados", "G30:H30": "M\u00e9dia Dias em Aberto", "I30:J30": "Maior Tempo (Dias)"}
+    for cell_range, value in provider_headers.items():
+        merge_set(ws, cell_range, value, fill_name="blue", font_obj=font(10, True, "white"), alignment=align(), border=thin_border)
+    provider_df = pd.DataFrame(closing.get("provider_summary", [])).head(19)
+    for index in range(19):
+        row_num = 31 + index
+        record = provider_df.iloc[index].to_dict() if index < len(provider_df) else {}
+        row_fill = "light_blue" if index % 2 == 0 else "white"
+        merge_set(ws, f"B{row_num}:D{row_num}", safe_text(record.get("Provedor")), fill_name=row_fill, font_obj=font(9), alignment=align("left"), border=thin_border)
+        merge_set(ws, f"E{row_num}:F{row_num}", record.get("Quantidade", "") if record else "", fill_name=row_fill, font_obj=font(9), alignment=align(), border=thin_border)
+        merge_set(ws, f"G{row_num}:H{row_num}", record.get("M\u00e9dia de dias em aberto", "") if record else "", fill_name=row_fill, font_obj=font(9), alignment=align(), border=thin_border)
+        merge_set(ws, f"I{row_num}:J{row_num}", record.get("Maior tempo em aberto", "") if record else "", fill_name=row_fill, font_obj=font(9), alignment=align(), border=thin_border)
+
+    uf_start = 51
+    merge_set(ws, f"B{uf_start}:J{uf_start}", "DISTRIBUI\u00c7\u00c3O POR ESTADO (UF)", fill_name="navy", font_obj=font(11, True, "white"), alignment=align(), border=medium_border)
+    for cell_range, value in {f"B{uf_start + 1}:C{uf_start + 1}": "UF", f"D{uf_start + 1}:F{uf_start + 1}": "Quantidade", f"G{uf_start + 1}:J{uf_start + 1}": "Percentual"}.items():
+        merge_set(ws, cell_range, value, fill_name="blue", font_obj=font(10, True, "white"), alignment=align(), border=thin_border)
+    uf_df = pd.DataFrame(closing.get("uf_summary", []))
+    uf_rows = max(7, len(uf_df))
+    for index in range(uf_rows):
+        row_num = uf_start + 2 + index
+        record = uf_df.iloc[index].to_dict() if index < len(uf_df) else {}
+        row_fill = "light_blue" if index % 2 == 0 else "white"
+        merge_set(ws, f"B{row_num}:C{row_num}", safe_text(record.get("UF")), fill_name=row_fill, font_obj=font(9), alignment=align(), border=thin_border)
+        merge_set(ws, f"D{row_num}:F{row_num}", record.get("Quantidade", "") if record else "", fill_name=row_fill, font_obj=font(9), alignment=align(), border=thin_border)
+        merge_set(ws, f"G{row_num}:J{row_num}", percent_value(record.get("Percentual", 0)) if record else "", fill_name=row_fill, font_obj=font(9), alignment=align(), border=thin_border)
+        if record:
+            ws[f"G{row_num}"].number_format = "0.0%"
+
+    attention_start = max(61, uf_start + 3 + uf_rows)
+    merge_set(ws, f"B{attention_start}:J{attention_start}", "PONTOS DE ATEN\u00c7\u00c3O", fill_name="red", font_obj=font(11, True, "white"), alignment=align(), border=medium_border)
+    alerts = closing.get("alerts", []) + closing.get("manual_attention_items", [])
+    if not alerts:
+        alerts = ["N\u00e3o h\u00e1 pontos de aten\u00e7\u00e3o adicionais registrados."]
+    for index, item in enumerate(alerts):
+        row_num = attention_start + 1 + index
+        merge_set(ws, f"B{row_num}:J{row_num}", f"\u2022 {item}", fill_name="light_red", font_obj=font(10), alignment=align("left", wrap=True), border=thin_border)
+        ws.row_dimensions[row_num].height = 24
+
+    next_start = attention_start + len(alerts) + 2
+    merge_set(ws, f"B{next_start}:J{next_start}", "PR\u00d3XIMAS ATIVIDADES", fill_name="blue", font_obj=font(11, True, "white"), alignment=align(), border=medium_border)
+    merge_set(
+        ws,
+        f"B{next_start + 1}:J{next_start + 1}",
+        closing.get("next_actions") or "Manter acompanhamento dos chamados cr\u00edticos e pend\u00eancias com as provedoras.",
+        fill_name="next_blue",
+        font_obj=font(10),
+        alignment=align("left", wrap=True),
+        border=thin_border,
+    )
+    ws.row_dimensions[next_start + 1].height = 28
+
+    ws_all = wb.create_sheet("Todos os Chamados")
+    prepare_sheet(ws_all, {"A": 3, "B": 18, "C": 22, "D": 15, "E": 9, "F": 50})
+    ws_all.row_dimensions[1].height = 7.5
+    ws_all.row_dimensions[2].height = 31.5
+    ws_all.row_dimensions[3].height = 9.75
+    merge_set(
+        ws_all,
+        "B2:F2",
+        f"HUB REDES \u2013 EACE  |  TODOS OS CHAMADOS DE REDE EXTERNA  |  {report_date}",
+        fill_name="navy",
+        font_obj=font(13, True, "white"),
+        alignment=align(),
+    )
+    headers = ["Ticket/OS", "Provedor", "Dias em Aberto", "INEP", "Escola"]
+    for col_idx, header in enumerate(headers, start=2):
+        cell = ws_all.cell(4, col_idx, header)
+        style_cell(cell, fill_name="blue", font_obj=font(10, True, "white"), alignment=align(), border=thin_border)
+    full_df = pd.DataFrame(closing.get("full_rows", []))
+    if not full_df.empty and "Dias em aberto" in full_df.columns:
+        full_df = full_df.sort_values("Dias em aberto", ascending=False)
+    for index, (_, record) in enumerate(full_df.iterrows(), start=0):
+        row_num = 5 + index
+        ws_all.row_dimensions[row_num].height = 16.5
+        data = record.to_dict()
+        row_fill = severity_fill(days_value(data), index)
+        values = [safe_text(data.get("Ticket/OS")), safe_text(data.get("Provedor")), days_value(data), safe_text(data.get("INEP")), safe_text(data.get("Escola"))]
+        for col_idx, value in enumerate(values, start=2):
+            cell = ws_all.cell(row_num, col_idx, value)
+            horizontal = "center" if col_idx == 4 else "left"
+            style_cell(cell, fill_name=row_fill, font_obj=font(9), alignment=align(horizontal), border=thin_border)
+    total_row = 5 + len(full_df)
+    merge_set(ws_all, f"B{total_row}:D{total_row}", "TOTAL DE CHAMADOS", fill_name="navy", font_obj=font(10, True, "white"), alignment=align(), border=medium_border)
+    ws_all[f"E{total_row}"] = len(full_df)
+    style_cell(ws_all[f"E{total_row}"], fill_name="navy", font_obj=font(10, True, "white"), alignment=align(), border=medium_border)
+
+    ws_mov = wb.create_sheet("Movimenta\u00e7\u00f5es do Dia")
+    prepare_sheet(ws_mov, {"A": 3, "B": 72.57, "C": 34.43})
+    ws_mov.row_dimensions[1].height = 7.5
+    ws_mov.row_dimensions[2].height = 31.5
+    ws_mov.row_dimensions[3].height = 9.75
+    merge_set(
+        ws_mov,
+        "B2:C2",
+        f"HUB REDES \u2013 EACE  |  MOVIMENTA\u00c7\u00d5ES DO DIA \u2013 {report_date}",
+        fill_name="navy",
+        font_obj=font(13, True, "white"),
+        alignment=align(),
+    )
+    for coord, label in {"B4": "ATUALIZADOS NO SISTEMA", "C4": "ENCERRADOS"}.items():
+        ws_mov[coord] = label
+        style_cell(ws_mov[coord], fill_name="blue", font_obj=font(10, True, "white"), alignment=align(), border=medium_border)
+    movements = [("B", closing.get("updated_items", []), "light_blue"), ("C", closing.get("closed_items", []), "light_green")]
+    for col, items, color_name in movements:
+        for index, item in enumerate(items):
+            row_num = 5 + index
+            ws_mov.row_dimensions[row_num].height = 18
+            cell = ws_mov[f"{col}{row_num}"]
+            cell.value = item
+            style_cell(cell, fill_name=color_name if index % 2 == 0 else "white", font_obj=font(10), alignment=align(), border=thin_border)
+        total_row = 5 + len(items)
+        ws_mov[f"{col}{total_row}"] = f"Total: {len(items)}"
+        style_cell(ws_mov[f"{col}{total_row}"], fill_name="navy", font_obj=font(10, True, "white"), alignment=align(), border=medium_border)
+
+    output = BytesIO()
+    wb.save(output)
+    return output.getvalue()
 
 
 def _render_item_list(items: list[str], empty_message: str) -> None:
@@ -903,12 +1217,21 @@ def render_daily_report(closing: dict | None) -> None:
     st.markdown("#### 11. Proximas atividades")
     st.write(closing.get("next_actions") or "Manter acompanhamento dos chamados críticos e pendências com as provedoras.")
 
+    export_pdf_col, export_excel_col = st.columns(2)
     pdf_bytes = generate_daily_report_pdf(closing)
-    st.download_button(
-        "Baixar relatório em PDF",
+    excel_bytes = generate_daily_report_excel(closing)
+    export_pdf_col.download_button(
+        "Baixar relat\u00f3rio em PDF",
         pdf_bytes,
         file_name=f"relatorio_diario_{closing.get('report_date', date.today().isoformat())}.pdf",
         mime="application/pdf",
+        use_container_width=True,
+    )
+    export_excel_col.download_button(
+        "Baixar relat\u00f3rio em Excel",
+        excel_bytes,
+        file_name=f"relatorio_monitoramento_{closing.get('report_date', date.today().isoformat())}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
 

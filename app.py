@@ -1526,15 +1526,19 @@ with t4:
                                 "ISP": d["isp"],
                                 "Uptime": d["uptime"],
                             })
-                        df_rx = pd.DataFrame(rows)
+                        rx_columns = ["Nome", "Estado", LAST_SEEN_COLUMN, "IP", "ISP", "Uptime"]
+                        df_rx = pd.DataFrame(rows, columns=rx_columns)
                         if filtro:
                             df_rx = df_rx[df_rx["Nome"].str.upper().str.contains(filtro.upper(), na=False)]
                         m1, m2, m3 = st.columns(3)
                         m1.metric("Total hosts", len(df_rx))
                         m2.metric("Conectados",  (df_rx["Estado"] == "connected").sum())
                         m3.metric("Offline",     (df_rx["Estado"] == "disconnected").sum())
-                        st.dataframe(df_rx.style.map(cor_estado, subset=["Estado"]),
-                                     use_container_width=True, height=440)
+                        if df_rx.empty:
+                            st.info("Nenhum host encontrado para esta conta/filtro.")
+                        else:
+                            st.dataframe(df_rx.style.map(cor_estado, subset=["Estado"]),
+                                         use_container_width=True, height=440)
                         st.download_button("⬇️ Exportar", to_xlsx(df_rx),
                             f"raio_x_{conta_rx}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
