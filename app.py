@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from io import BytesIO
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
 from modules.daily_report import render_daily_closing_admin, render_daily_report
@@ -457,7 +457,20 @@ def obter_config(*chaves, default: str = "") -> str:
 
 def obter_url_publica_hub() -> str:
     url = obter_config("hub_public_url", "HUB_PUBLIC_URL", default="").rstrip("/")
-    return url or "http://localhost:8501"
+    if url:
+        return url
+
+    try:
+        current_url = str(getattr(st.context, "url", "") or "")
+        if current_url:
+            parsed = urlsplit(current_url)
+            if parsed.scheme and parsed.netloc:
+                base_path = parsed.path.rstrip("/")
+                return f"{parsed.scheme}://{parsed.netloc}{base_path}"
+    except Exception:
+        pass
+
+    return "http://localhost:8501"
 
 
 def obter_config_supabase() -> tuple[str, str, str, str]:
@@ -645,11 +658,20 @@ def montar_links_decisao_solicitacao(request_id: str, token: str) -> tuple[str, 
 
 
 def enviar_email_smtp(to_email: str, subject: str, text: str, html_body: str) -> tuple[bool, str]:
-    host = obter_config(("smtp", "host"), "smtp_host", "SMTP_HOST", default="")
-    user = obter_config(("smtp", "user"), "smtp_user", "SMTP_USER", default="")
-    password = obter_config(("smtp", "password"), "smtp_password", "SMTP_PASSWORD", default="")
-    if not host or not user or not password:
-        return False, "Envio de e-mail não configurado."
+    host = obter_config(("smtp", "host"), "smtp_host", "SMTP_HOST", default="smtp.gmail.com")
+    user = obter_config(
+        ("smtp", "user"),
+        "smtp_user",
+        "SMTP_USER",
+        "gmail_user",
+        "GMAIL_USER",
+        default=HUB_REGISTRATION_EMAIL,
+    )
+    smtp_password = obter_config(("smtp", "password"), "smtp_password", "SMTP_PASSWORD", default="")
+    gmail_password = obter_config("gmail_app_password", "GMAIL_APP_PASSWORD", default="").replace(" ", "")
+    password = smtp_password or gmail_password
+    if not password:
+        return False, "Envio de e-mail não configurado: defina gmail_app_password nos Secrets."
 
     port = int(obter_config(("smtp", "port"), "smtp_port", "SMTP_PORT", default="587"))
     from_email = obter_config(("smtp", "from_email"), "smtp_from_email", "SMTP_FROM_EMAIL", default=user)
