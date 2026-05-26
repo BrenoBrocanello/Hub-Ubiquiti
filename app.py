@@ -774,9 +774,45 @@ def salvar_solicitacao_supabase(solicitacao: dict) -> None:
     supabase_request(
         "POST",
         requests_table,
+        "?on_conflict=id",
         payload=solicitacao,
-        prefer="return=minimal",
+        prefer="resolution=merge-duplicates,return=minimal",
     )
+
+
+def salvar_usuario_aprovado_supabase(solicitacao: dict) -> None:
+    _, _, _, users_table = obter_config_supabase()
+    supabase_request(
+        "POST",
+        users_table,
+        "?on_conflict=email",
+        payload={
+            "email": normalizar_email(solicitacao["email"]),
+            "name": solicitacao.get("name") or "",
+            "password_hash": solicitacao.get("password_hash") or "",
+            "active": True,
+            "approved_at": solicitacao.get("decided_at") or agora_iso(),
+            "approved_by": solicitacao.get("decided_by") or HUB_REGISTRATION_EMAIL,
+        },
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
+
+
+def migrar_solicitacoes_locais_para_supabase() -> tuple[int, int]:
+    if not supabase_ativo():
+        return 0, 0
+
+    migradas = 0
+    aprovadas = 0
+    for solicitacao in carregar_solicitacoes_locais():
+        if not solicitacao.get("id") or not solicitacao.get("email"):
+            continue
+        salvar_solicitacao_supabase(solicitacao)
+        migradas += 1
+        if solicitacao.get("status") == "approved":
+            salvar_usuario_aprovado_supabase(solicitacao)
+            aprovadas += 1
+    return migradas, aprovadas
 
 
 def salvar_solicitacao_local(solicitacao: dict) -> None:
@@ -838,7 +874,7 @@ def buscar_solicitacao_supabase(request_id: str) -> dict | None:
 
 
 def atualizar_solicitacao_supabase(solicitacao: dict, status: str) -> None:
-    _, _, requests_table, users_table = obter_config_supabase()
+    _, _, requests_table, _ = obter_config_supabase()
     payload = {
         "status": status,
         "decided_at": agora_iso(),
@@ -852,20 +888,9 @@ def atualizar_solicitacao_supabase(solicitacao: dict, status: str) -> None:
         prefer="return=minimal",
     )
     if status == "approved":
-        supabase_request(
-            "POST",
-            users_table,
-            "?on_conflict=email",
-            payload={
-                "email": normalizar_email(solicitacao["email"]),
-                "name": solicitacao.get("name") or "",
-                "password_hash": solicitacao.get("password_hash") or "",
-                "active": True,
-                "approved_at": agora_iso(),
-                "approved_by": HUB_REGISTRATION_EMAIL,
-            },
-            prefer="resolution=merge-duplicates,return=minimal",
-        )
+        solicitacao_aprovada = dict(solicitacao)
+        solicitacao_aprovada.update(payload)
+        salvar_usuario_aprovado_supabase(solicitacao_aprovada)
 
 
 def buscar_solicitacao_local(request_id: str) -> dict | None:
@@ -892,8 +917,15 @@ def decidir_solicitacao_acesso(request_id: str, token: str, action: str) -> tupl
     if not request_id or not token:
         return False, "Link de decisão inválido."
 
+    origem_local = False
     try:
-        solicitacao = buscar_solicitacao_supabase(request_id) if supabase_ativo() else buscar_solicitacao_local(request_id)
+        if supabase_ativo():
+            solicitacao = buscar_solicitacao_supabase(request_id)
+            if not solicitacao:
+                solicitacao = buscar_solicitacao_local(request_id)
+                origem_local = bool(solicitacao)
+        else:
+            solicitacao = buscar_solicitacao_local(request_id)
     except Exception as exc:
         return False, f"Não foi possível consultar a solicitação: {exc}"
 
@@ -908,7 +940,11 @@ def decidir_solicitacao_acesso(request_id: str, token: str, action: str) -> tupl
     novo_status = "approved" if action == "approve" else "rejected"
     try:
         if supabase_ativo():
+            if origem_local:
+                salvar_solicitacao_supabase(solicitacao)
             atualizar_solicitacao_supabase(solicitacao, novo_status)
+            if origem_local:
+                atualizar_solicitacao_local(request_id, novo_status)
         else:
             atualizar_solicitacao_local(request_id, novo_status)
     except Exception as exc:
@@ -1024,9 +1060,17 @@ def render_hub_login() -> None:
 for k, v in {
     "hub_authenticated": False,
     "hub_user_email": "",
+    "hub_local_requests_migrated": False,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+if not st.session_state.hub_local_requests_migrated:
+    try:
+        migrar_solicitacoes_locais_para_supabase()
+    except Exception:
+        pass
+    st.session_state.hub_local_requests_migrated = True
 
 if processar_link_decisao_acesso():
     st.stop()
