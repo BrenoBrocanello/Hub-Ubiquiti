@@ -476,7 +476,10 @@ def obter_url_publica_hub() -> str:
 def obter_config_supabase() -> tuple[str, str, str, str]:
     url = obter_config(("supabase", "url"), "supabase_url", "SUPABASE_URL", default="").rstrip("/")
     key = obter_config(
+        ("supabase", "secret_key"),
         ("supabase", "service_role_key"),
+        "supabase_secret_key",
+        "SUPABASE_SECRET_KEY",
         "supabase_service_role_key",
         "SUPABASE_SERVICE_ROLE_KEY",
         default="",
