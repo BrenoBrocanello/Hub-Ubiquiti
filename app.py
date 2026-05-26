@@ -2,6 +2,7 @@
 import requests
 import pandas as pd
 import json
+import hmac
 import os
 import re
 import time
@@ -20,6 +21,16 @@ CONFIG_PROVEDORES = "config_provedores.json"
 BASE_URL          = "https://api.ui.com/v1"
 APP_TZ            = ZoneInfo("America/Sao_Paulo")
 LAST_SEEN_COLUMN  = "Último Sinal"
+HUB_ACCESS_PASSWORD = "Q131234567890"
+HUB_ALLOWED_EMAILS = {
+    "anybezerra1234@gmail.com",
+    "alicemirand4@gmail.com",
+    "thaynavianamoura@gmail.com",
+    "lincolnjunqueira@gmail.com",
+    "celitamariemelo@gmail.com",
+    "robertorocha.q13@gmail.com",
+    "roberto1.rocha@gmail.com",
+}
 
 st.set_page_config(
     page_title="Hub Redes — EACE",
@@ -416,9 +427,61 @@ def carregar_provedores() -> dict:
             pass
     return {}
 
+
+def normalizar_email(email: str) -> str:
+    return str(email or "").strip().lower()
+
+
+def credenciais_hub_validas(email: str, senha: str) -> bool:
+    email_normalizado = normalizar_email(email)
+    senha_digitada = str(senha or "").strip()
+    return (
+        email_normalizado in HUB_ALLOWED_EMAILS
+        and hmac.compare_digest(senha_digitada, HUB_ACCESS_PASSWORD)
+    )
+
+
+def render_hub_login() -> None:
+    st.markdown(
+        """
+        <div style="max-width: 460px; margin: 7vh auto 22px auto; text-align: center;">
+            <p class="page-title" style="font-size: 34px; margin-bottom: 8px;">Hub Redes - EACE</p>
+            <p class="page-sub" style="margin: 0;">Acesso restrito ao hub geral</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    _, login_col, _ = st.columns([1, 1.1, 1])
+    with login_col:
+        with st.form("hub_login_form"):
+            email = st.text_input("E-mail", placeholder="seu.email@gmail.com")
+            senha = st.text_input("Senha", type="password")
+            entrar = st.form_submit_button("Entrar", type="primary", use_container_width=True)
+
+        if entrar:
+            if credenciais_hub_validas(email, senha):
+                st.session_state.hub_authenticated = True
+                st.session_state.hub_user_email = normalizar_email(email)
+                st.rerun()
+            else:
+                st.error("E-mail ou senha inválidos.")
+
+
 # ═══════════════════════════════════════════════════════════════
 # SESSION STATE
 # ═══════════════════════════════════════════════════════════════
+for k, v in {
+    "hub_authenticated": False,
+    "hub_user_email": "",
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+if not st.session_state.hub_authenticated:
+    render_hub_login()
+    st.stop()
+
 for k, v in {
     "contas":            None,
     "provedores":        None,
@@ -1114,6 +1177,15 @@ def mesclar_isps_novos(isps_novos: set) -> int:
 # SIDEBAR
 # ═══════════════════════════════════════════════════════════════
 with st.sidebar:
+    st.caption(f"Conectado: `{st.session_state.hub_user_email}`")
+    if st.button("Sair", use_container_width=True):
+        st.session_state.hub_authenticated = False
+        st.session_state.hub_user_email = ""
+        st.session_state.daily_report_authenticated = False
+        st.rerun()
+
+    st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
+
     # Contas carregadas dos Secrets — sem exposição de chaves na UI
     validas = [c for c in st.session_state.contas if c.get("api_key", "").strip()]
 
