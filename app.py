@@ -3,12 +3,19 @@ import requests
 import pandas as pd
 import json
 import hmac
+import hashlib
+import html
 import os
 import re
+import secrets as token_secrets
+import smtplib
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from io import BytesIO
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from modules.daily_report import render_daily_closing_admin, render_daily_report
@@ -22,6 +29,8 @@ BASE_URL          = "https://api.ui.com/v1"
 APP_TZ            = ZoneInfo("America/Sao_Paulo")
 LAST_SEEN_COLUMN  = "Último Sinal"
 HUB_ACCESS_PASSWORD = "Q131234567890"
+HUB_REGISTRATION_EMAIL = "breno.brocanello@gmail.com"
+HUB_ACCESS_REQUESTS_FILE = os.path.join("data", "solicitacoes_acesso.json")
 HUB_ALLOWED_EMAILS = {
     "anybezerra1234@gmail.com",
     "alicemirand4@gmail.com",
@@ -428,17 +437,460 @@ def carregar_provedores() -> dict:
     return {}
 
 
+def agora_iso() -> str:
+    return datetime.now(APP_TZ).isoformat(timespec="seconds")
+
+
+def obter_config(*chaves, default: str = "") -> str:
+    for chave in chaves:
+        valor = None
+        try:
+            if isinstance(chave, tuple):
+                atual = st.secrets
+                for parte in chave:
+                    atual = atual[parte]
+                valor = atual
+            elif chave in st.secrets:
+                valor = st.secrets[chave]
+        except Exception:
+            valor = None
+
+        if valor is None and isinstance(chave, str):
+            valor = os.getenv(chave) or os.getenv(chave.upper())
+
+        if valor is not None and str(valor).strip():
+            return str(valor).strip()
+    return default
+
+
+def obter_senha_hub() -> str:
+    return obter_config("hub_access_password", "HUB_ACCESS_PASSWORD", default=HUB_ACCESS_PASSWORD)
+
+
+def obter_url_publica_hub() -> str:
+    url = obter_config("hub_public_url", "HUB_PUBLIC_URL", default="").rstrip("/")
+    return url or "http://localhost:8501"
+
+
+def obter_config_supabase() -> tuple[str, str, str, str]:
+    url = obter_config(("supabase", "url"), "supabase_url", "SUPABASE_URL", default="").rstrip("/")
+    key = obter_config(
+        ("supabase", "service_role_key"),
+        "supabase_service_role_key",
+        "SUPABASE_SERVICE_ROLE_KEY",
+        default="",
+    )
+    requests_table = obter_config(
+        ("supabase", "access_requests_table"),
+        "supabase_access_requests_table",
+        default="hub_access_requests",
+    )
+    users_table = obter_config(
+        ("supabase", "allowed_users_table"),
+        "supabase_allowed_users_table",
+        default="hub_allowed_users",
+    )
+    return url, key, requests_table, users_table
+
+
+def supabase_ativo() -> bool:
+    url, key, _, _ = obter_config_supabase()
+    return bool(url and key)
+
+
+def supabase_headers(extra: dict | None = None) -> dict:
+    _, key, _, _ = obter_config_supabase()
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def supabase_request(method: str, table: str, query: str = "", payload=None, prefer: str | None = None):
+    url, _, _, _ = obter_config_supabase()
+    endpoint = f"{url}/rest/v1/{table}{query}"
+    extra = {"Prefer": prefer} if prefer else None
+    resp = requests.request(
+        method,
+        endpoint,
+        headers=supabase_headers(extra),
+        json=payload,
+        timeout=15,
+    )
+    if resp.status_code >= 400:
+        detalhe = resp.text[:300] if resp.text else resp.reason
+        raise RuntimeError(f"Supabase retornou {resp.status_code}: {detalhe}")
+    if not resp.text:
+        return None
+    try:
+        return resp.json()
+    except ValueError:
+        return None
+
+
+def carregar_solicitacoes_locais() -> list[dict]:
+    if not os.path.exists(HUB_ACCESS_REQUESTS_FILE):
+        return []
+    try:
+        with open(HUB_ACCESS_REQUESTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def salvar_solicitacoes_locais(solicitacoes: list[dict]) -> None:
+    os.makedirs(os.path.dirname(HUB_ACCESS_REQUESTS_FILE), exist_ok=True)
+    with open(HUB_ACCESS_REQUESTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(solicitacoes, f, indent=2, ensure_ascii=False)
+
+
 def normalizar_email(email: str) -> str:
     return str(email or "").strip().lower()
+
+
+def email_parece_valido(email: str) -> bool:
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalizar_email(email)))
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def carregar_emails_aprovados_supabase() -> set[str]:
+    if not supabase_ativo():
+        return set()
+    _, _, _, users_table = obter_config_supabase()
+    try:
+        rows = supabase_request(
+            "GET",
+            users_table,
+            "?select=email&active=eq.true",
+        ) or []
+        return {normalizar_email(row.get("email")) for row in rows if row.get("email")}
+    except Exception:
+        return set()
+
+
+def carregar_emails_aprovados_locais() -> set[str]:
+    emails = set()
+    for item in carregar_solicitacoes_locais():
+        if item.get("status") == "approved" and item.get("email"):
+            emails.add(normalizar_email(item["email"]))
+    return emails
+
+
+def carregar_emails_permitidos() -> set[str]:
+    emails = {normalizar_email(email) for email in HUB_ALLOWED_EMAILS}
+    emails.update(carregar_emails_aprovados_locais())
+    emails.update(carregar_emails_aprovados_supabase())
+    return emails
 
 
 def credenciais_hub_validas(email: str, senha: str) -> bool:
     email_normalizado = normalizar_email(email)
     senha_digitada = str(senha or "").strip()
     return (
-        email_normalizado in HUB_ALLOWED_EMAILS
-        and hmac.compare_digest(senha_digitada, HUB_ACCESS_PASSWORD)
+        email_normalizado in carregar_emails_permitidos()
+        and hmac.compare_digest(senha_digitada, obter_senha_hub())
     )
+
+
+def montar_links_decisao_solicitacao(request_id: str, token: str) -> tuple[str, str]:
+    base_url = obter_url_publica_hub()
+    approve_url = f"{base_url}?access_action=approve&request_id={quote(request_id)}&approval_token={quote(token)}"
+    reject_url = f"{base_url}?access_action=reject&request_id={quote(request_id)}&approval_token={quote(token)}"
+    return approve_url, reject_url
+
+
+def enviar_email_smtp(to_email: str, subject: str, text: str, html_body: str) -> tuple[bool, str]:
+    host = obter_config(("smtp", "host"), "smtp_host", "SMTP_HOST", default="")
+    user = obter_config(("smtp", "user"), "smtp_user", "SMTP_USER", default="")
+    password = obter_config(("smtp", "password"), "smtp_password", "SMTP_PASSWORD", default="")
+    if not host or not user or not password:
+        return False, "Envio de e-mail não configurado."
+
+    port = int(obter_config(("smtp", "port"), "smtp_port", "SMTP_PORT", default="587"))
+    from_email = obter_config(("smtp", "from_email"), "smtp_from_email", "SMTP_FROM_EMAIL", default=user)
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = from_email
+    msg["To"] = to_email
+    msg.attach(MIMEText(text, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    try:
+        with smtplib.SMTP(host, port, timeout=15) as server:
+            server.starttls()
+            server.login(user, password)
+            server.sendmail(from_email, [to_email], msg.as_string())
+        return True, "E-mail enviado por SMTP."
+    except Exception as exc:
+        return False, f"Falha no SMTP: {exc}"
+
+
+def enviar_email_resend(to_email: str, subject: str, text: str, html_body: str) -> tuple[bool, str]:
+    api_key = obter_config(("resend", "api_key"), "resend_api_key", "RESEND_API_KEY", default="")
+    if not api_key:
+        return False, "Resend não configurado."
+
+    from_email = obter_config(
+        ("resend", "from_email"),
+        "resend_from_email",
+        "RESEND_FROM_EMAIL",
+        default="Hub Ubiquiti <onboarding@resend.dev>",
+    )
+    payload = {
+        "from": from_email,
+        "to": [to_email],
+        "subject": subject,
+        "text": text,
+        "html": html_body,
+    }
+    try:
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            return False, f"Resend retornou {resp.status_code}: {resp.text[:300]}"
+        return True, "E-mail enviado por Resend."
+    except Exception as exc:
+        return False, f"Falha no Resend: {exc}"
+
+
+def enviar_email_solicitacao_acesso(solicitacao: dict, approve_url: str, reject_url: str) -> tuple[bool, str]:
+    nome = html.escape(solicitacao.get("name") or "Não informado")
+    email = html.escape(solicitacao.get("email") or "")
+    motivo = html.escape(solicitacao.get("reason") or "Não informado")
+    criado_em = html.escape(solicitacao.get("created_at") or agora_iso())
+    subject = f"Solicitação de acesso ao Hub Ubiquiti - {email}"
+    text = (
+        "Nova solicitação de acesso ao Hub Ubiquiti\n\n"
+        f"Nome: {solicitacao.get('name') or 'Não informado'}\n"
+        f"E-mail: {solicitacao.get('email')}\n"
+        f"Motivo: {solicitacao.get('reason') or 'Não informado'}\n"
+        f"Criado em: {solicitacao.get('created_at') or agora_iso()}\n\n"
+        f"Aprovar: {approve_url}\n"
+        f"Recusar: {reject_url}\n"
+    )
+    html_body = f"""
+    <div style="font-family: Arial, sans-serif; color: #111827; line-height: 1.5;">
+        <h2>Nova solicitação de acesso</h2>
+        <p><strong>Nome:</strong> {nome}</p>
+        <p><strong>E-mail:</strong> {email}</p>
+        <p><strong>Motivo:</strong> {motivo}</p>
+        <p><strong>Criado em:</strong> {criado_em}</p>
+        <p style="margin-top: 24px;">
+            <a href="{html.escape(approve_url)}"
+               style="background:#16a34a;color:#fff;padding:10px 16px;text-decoration:none;border-radius:6px;margin-right:8px;">
+               Aprovar acesso
+            </a>
+            <a href="{html.escape(reject_url)}"
+               style="background:#dc2626;color:#fff;padding:10px 16px;text-decoration:none;border-radius:6px;">
+               Recusar
+            </a>
+        </p>
+    </div>
+    """
+
+    ok, msg = enviar_email_resend(HUB_REGISTRATION_EMAIL, subject, text, html_body)
+    if ok:
+        return ok, msg
+    return enviar_email_smtp(HUB_REGISTRATION_EMAIL, subject, text, html_body)
+
+
+def salvar_solicitacao_supabase(solicitacao: dict) -> None:
+    _, _, requests_table, _ = obter_config_supabase()
+    supabase_request(
+        "POST",
+        requests_table,
+        payload=solicitacao,
+        prefer="return=minimal",
+    )
+
+
+def salvar_solicitacao_local(solicitacao: dict) -> None:
+    solicitacoes = carregar_solicitacoes_locais()
+    solicitacoes.append(solicitacao)
+    salvar_solicitacoes_locais(solicitacoes)
+
+
+def criar_solicitacao_acesso(nome: str, email: str, motivo: str) -> tuple[bool, str]:
+    email_normalizado = normalizar_email(email)
+    if not nome.strip():
+        return False, "Informe seu nome."
+    if not email_parece_valido(email_normalizado):
+        return False, "Informe um e-mail válido."
+    if email_normalizado in carregar_emails_permitidos():
+        return False, "Este e-mail já está liberado para acessar o hub."
+
+    request_id = token_secrets.token_hex(12)
+    token = token_secrets.token_urlsafe(32)
+    solicitacao = {
+        "id": request_id,
+        "name": nome.strip(),
+        "email": email_normalizado,
+        "reason": motivo.strip(),
+        "status": "pending",
+        "token_hash": hash_token(token),
+        "created_at": agora_iso(),
+        "decided_at": None,
+        "decided_by": None,
+    }
+
+    try:
+        if supabase_ativo():
+            salvar_solicitacao_supabase(solicitacao)
+        else:
+            salvar_solicitacao_local(solicitacao)
+    except Exception as exc:
+        return False, f"Não foi possível registrar a solicitação: {exc}"
+
+    approve_url, reject_url = montar_links_decisao_solicitacao(request_id, token)
+    email_ok, email_msg = enviar_email_solicitacao_acesso(solicitacao, approve_url, reject_url)
+    if not email_ok:
+        return True, f"Solicitação registrada, mas o e-mail ao administrador não foi enviado: {email_msg}"
+    return True, "Solicitação enviada. O acesso ficará pendente até aprovação."
+
+
+def buscar_solicitacao_supabase(request_id: str) -> dict | None:
+    _, _, requests_table, _ = obter_config_supabase()
+    rows = supabase_request(
+        "GET",
+        requests_table,
+        f"?select=*&id=eq.{quote(request_id)}&limit=1",
+    ) or []
+    return rows[0] if rows else None
+
+
+def atualizar_solicitacao_supabase(solicitacao: dict, status: str) -> None:
+    _, _, requests_table, users_table = obter_config_supabase()
+    payload = {
+        "status": status,
+        "decided_at": agora_iso(),
+        "decided_by": HUB_REGISTRATION_EMAIL,
+    }
+    supabase_request(
+        "PATCH",
+        requests_table,
+        f"?id=eq.{quote(solicitacao['id'])}",
+        payload=payload,
+        prefer="return=minimal",
+    )
+    if status == "approved":
+        supabase_request(
+            "POST",
+            users_table,
+            "?on_conflict=email",
+            payload={
+                "email": normalizar_email(solicitacao["email"]),
+                "name": solicitacao.get("name") or "",
+                "active": True,
+                "approved_at": agora_iso(),
+                "approved_by": HUB_REGISTRATION_EMAIL,
+            },
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+
+
+def buscar_solicitacao_local(request_id: str) -> dict | None:
+    for solicitacao in carregar_solicitacoes_locais():
+        if solicitacao.get("id") == request_id:
+            return solicitacao
+    return None
+
+
+def atualizar_solicitacao_local(request_id: str, status: str) -> None:
+    solicitacoes = carregar_solicitacoes_locais()
+    for solicitacao in solicitacoes:
+        if solicitacao.get("id") == request_id:
+            solicitacao["status"] = status
+            solicitacao["decided_at"] = agora_iso()
+            solicitacao["decided_by"] = HUB_REGISTRATION_EMAIL
+            break
+    salvar_solicitacoes_locais(solicitacoes)
+
+
+def decidir_solicitacao_acesso(request_id: str, token: str, action: str) -> tuple[bool, str]:
+    if action not in {"approve", "reject"}:
+        return False, "Ação inválida."
+    if not request_id or not token:
+        return False, "Link de decisão inválido."
+
+    try:
+        solicitacao = buscar_solicitacao_supabase(request_id) if supabase_ativo() else buscar_solicitacao_local(request_id)
+    except Exception as exc:
+        return False, f"Não foi possível consultar a solicitação: {exc}"
+
+    if not solicitacao:
+        return False, "Solicitação não encontrada."
+    if not hmac.compare_digest(str(solicitacao.get("token_hash", "")), hash_token(token)):
+        return False, "Token de aprovação inválido."
+    if solicitacao.get("status") in {"approved", "rejected"}:
+        status_txt = "aprovada" if solicitacao.get("status") == "approved" else "recusada"
+        return True, f"Esta solicitação já tinha sido {status_txt}."
+
+    novo_status = "approved" if action == "approve" else "rejected"
+    try:
+        if supabase_ativo():
+            atualizar_solicitacao_supabase(solicitacao, novo_status)
+        else:
+            atualizar_solicitacao_local(request_id, novo_status)
+    except Exception as exc:
+        return False, f"Não foi possível atualizar a solicitação: {exc}"
+
+    if novo_status == "approved":
+        return True, f"Acesso aprovado para {normalizar_email(solicitacao.get('email'))}."
+    return True, f"Solicitação recusada para {normalizar_email(solicitacao.get('email'))}."
+
+
+def obter_query_param(nome: str) -> str:
+    try:
+        valor = st.query_params.get(nome, "")
+        if isinstance(valor, list):
+            return str(valor[0]) if valor else ""
+        return str(valor)
+    except Exception:
+        return ""
+
+
+def processar_link_decisao_acesso() -> bool:
+    action = obter_query_param("access_action")
+    if action not in {"approve", "reject"}:
+        return False
+
+    request_id = obter_query_param("request_id")
+    token = obter_query_param("approval_token")
+    ok, msg = decidir_solicitacao_acesso(request_id, token, action)
+
+    st.markdown(
+        """
+        <div style="max-width: 540px; margin: 10vh auto 24px auto; text-align: center;">
+            <p class="page-title" style="font-size: 30px; margin-bottom: 8px;">Solicitação de acesso</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if ok:
+        st.success(msg)
+    else:
+        st.error(msg)
+    if st.button("Voltar para o login", type="primary"):
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+        st.rerun()
+    return True
 
 
 def render_hub_login() -> None:
@@ -454,18 +906,38 @@ def render_hub_login() -> None:
 
     _, login_col, _ = st.columns([1, 1.1, 1])
     with login_col:
-        with st.form("hub_login_form"):
-            email = st.text_input("E-mail", placeholder="seu.email@gmail.com")
-            senha = st.text_input("Senha", type="password")
-            entrar = st.form_submit_button("Entrar", type="primary", use_container_width=True)
+        login_tab, register_tab = st.tabs(["Entrar", "Registre-se"])
 
-        if entrar:
-            if credenciais_hub_validas(email, senha):
-                st.session_state.hub_authenticated = True
-                st.session_state.hub_user_email = normalizar_email(email)
-                st.rerun()
-            else:
-                st.error("E-mail ou senha inválidos.")
+        with login_tab:
+            with st.form("hub_login_form"):
+                email = st.text_input("E-mail", placeholder="seu.email@gmail.com")
+                senha = st.text_input("Senha", type="password")
+                entrar = st.form_submit_button("Entrar", type="primary", use_container_width=True)
+
+            if entrar:
+                if credenciais_hub_validas(email, senha):
+                    st.session_state.hub_authenticated = True
+                    st.session_state.hub_user_email = normalizar_email(email)
+                    st.rerun()
+                else:
+                    st.error("E-mail ou senha inválidos.")
+
+        with register_tab:
+            with st.form("hub_register_form"):
+                nome = st.text_input("Nome completo")
+                email_registro = st.text_input("E-mail corporativo ou Gmail", key="hub_register_email")
+                motivo = st.text_area("Motivo do acesso", height=90)
+                registrar = st.form_submit_button("Enviar solicitação", type="primary", use_container_width=True)
+
+            if registrar:
+                ok, msg = criar_solicitacao_acesso(nome, email_registro, motivo)
+                if ok:
+                    if "não foi enviado" in msg:
+                        st.warning(msg)
+                    else:
+                        st.success(msg)
+                else:
+                    st.error(msg)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -477,6 +949,9 @@ for k, v in {
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+if processar_link_decisao_acesso():
+    st.stop()
 
 if not st.session_state.hub_authenticated:
     render_hub_login()
