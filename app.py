@@ -28,18 +28,10 @@ CONFIG_PROVEDORES = "config_provedores.json"
 BASE_URL          = "https://api.ui.com/v1"
 APP_TZ            = ZoneInfo("America/Sao_Paulo")
 LAST_SEEN_COLUMN  = "Último Sinal"
-HUB_ACCESS_PASSWORD = "Q131234567890"
 HUB_REGISTRATION_EMAIL = "breno.brocanello@gmail.com"
 HUB_ACCESS_REQUESTS_FILE = os.path.join("data", "solicitacoes_acesso.json")
-HUB_ALLOWED_EMAILS = {
-    "anybezerra1234@gmail.com",
-    "alicemirand4@gmail.com",
-    "thaynavianamoura@gmail.com",
-    "lincolnjunqueira@gmail.com",
-    "celitamariemelo@gmail.com",
-    "robertorocha.q13@gmail.com",
-    "roberto1.rocha@gmail.com",
-}
+HUB_PASSWORD_HASH_ITERATIONS = 260_000
+HUB_ALLOWED_EMAILS = set()
 
 st.set_page_config(
     page_title="Hub Redes — EACE",
@@ -463,10 +455,6 @@ def obter_config(*chaves, default: str = "") -> str:
     return default
 
 
-def obter_senha_hub() -> str:
-    return obter_config("hub_access_password", "HUB_ACCESS_PASSWORD", default=HUB_ACCESS_PASSWORD)
-
-
 def obter_url_publica_hub() -> str:
     url = obter_config("hub_public_url", "HUB_PUBLIC_URL", default="").rstrip("/")
     return url or "http://localhost:8501"
@@ -562,43 +550,91 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
 
 
-def carregar_emails_aprovados_supabase() -> set[str]:
+def gerar_hash_senha(senha: str) -> str:
+    salt = token_secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        str(senha or "").encode("utf-8"),
+        salt.encode("utf-8"),
+        HUB_PASSWORD_HASH_ITERATIONS,
+    ).hex()
+    return f"pbkdf2_sha256${HUB_PASSWORD_HASH_ITERATIONS}${salt}${digest}"
+
+
+def verificar_hash_senha(senha: str, senha_hash: str) -> bool:
+    partes = str(senha_hash or "").split("$")
+    if len(partes) != 4 or partes[0] != "pbkdf2_sha256":
+        return False
+    try:
+        iteracoes = int(partes[1])
+        salt = partes[2]
+        digest_salvo = partes[3]
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            str(senha or "").encode("utf-8"),
+            salt.encode("utf-8"),
+            iteracoes,
+        ).hex()
+        return hmac.compare_digest(digest, digest_salvo)
+    except Exception:
+        return False
+
+
+def validar_senha_registro(senha: str, confirmacao: str) -> tuple[bool, str]:
+    if not senha:
+        return False, "Informe uma senha."
+    if len(senha) < 8:
+        return False, "A senha precisa ter pelo menos 8 caracteres."
+    if senha != confirmacao:
+        return False, "A confirmação da senha não confere."
+    return True, ""
+
+
+def carregar_usuarios_aprovados_supabase() -> dict[str, dict]:
     if not supabase_ativo():
-        return set()
+        return {}
     _, _, _, users_table = obter_config_supabase()
     try:
         rows = supabase_request(
             "GET",
             users_table,
-            "?select=email&active=eq.true",
+            "?select=email,name,password_hash&active=eq.true",
         ) or []
-        return {normalizar_email(row.get("email")) for row in rows if row.get("email")}
+        return {
+            normalizar_email(row.get("email")): row
+            for row in rows
+            if row.get("email")
+        }
     except Exception:
-        return set()
+        return {}
 
 
-def carregar_emails_aprovados_locais() -> set[str]:
-    emails = set()
+def carregar_usuarios_aprovados_locais() -> dict[str, dict]:
+    usuarios = {}
     for item in carregar_solicitacoes_locais():
         if item.get("status") == "approved" and item.get("email"):
-            emails.add(normalizar_email(item["email"]))
-    return emails
+            usuarios[normalizar_email(item["email"])] = item
+    return usuarios
+
+
+def carregar_usuarios_aprovados() -> dict[str, dict]:
+    usuarios = carregar_usuarios_aprovados_locais()
+    usuarios.update(carregar_usuarios_aprovados_supabase())
+    return usuarios
 
 
 def carregar_emails_permitidos() -> set[str]:
     emails = {normalizar_email(email) for email in HUB_ALLOWED_EMAILS}
-    emails.update(carregar_emails_aprovados_locais())
-    emails.update(carregar_emails_aprovados_supabase())
+    emails.update(carregar_usuarios_aprovados().keys())
     return emails
 
 
 def credenciais_hub_validas(email: str, senha: str) -> bool:
     email_normalizado = normalizar_email(email)
-    senha_digitada = str(senha or "").strip()
-    return (
-        email_normalizado in carregar_emails_permitidos()
-        and hmac.compare_digest(senha_digitada, obter_senha_hub())
-    )
+    usuario = carregar_usuarios_aprovados().get(email_normalizado)
+    if not usuario:
+        return False
+    return verificar_hash_senha(senha, usuario.get("password_hash", ""))
 
 
 def montar_links_decisao_solicitacao(request_id: str, token: str) -> tuple[str, str]:
@@ -724,12 +760,15 @@ def salvar_solicitacao_local(solicitacao: dict) -> None:
     salvar_solicitacoes_locais(solicitacoes)
 
 
-def criar_solicitacao_acesso(nome: str, email: str, motivo: str) -> tuple[bool, str]:
+def criar_solicitacao_acesso(nome: str, email: str, motivo: str, senha: str, confirmacao_senha: str) -> tuple[bool, str]:
     email_normalizado = normalizar_email(email)
     if not nome.strip():
         return False, "Informe seu nome."
     if not email_parece_valido(email_normalizado):
         return False, "Informe um e-mail válido."
+    senha_ok, senha_msg = validar_senha_registro(senha, confirmacao_senha)
+    if not senha_ok:
+        return False, senha_msg
     if email_normalizado in carregar_emails_permitidos():
         return False, "Este e-mail já está liberado para acessar o hub."
 
@@ -742,6 +781,7 @@ def criar_solicitacao_acesso(nome: str, email: str, motivo: str) -> tuple[bool, 
         "reason": motivo.strip(),
         "status": "pending",
         "token_hash": hash_token(token),
+        "password_hash": gerar_hash_senha(senha),
         "created_at": agora_iso(),
         "decided_at": None,
         "decided_by": None,
@@ -794,6 +834,7 @@ def atualizar_solicitacao_supabase(solicitacao: dict, status: str) -> None:
             payload={
                 "email": normalizar_email(solicitacao["email"]),
                 "name": solicitacao.get("name") or "",
+                "password_hash": solicitacao.get("password_hash") or "",
                 "active": True,
                 "approved_at": agora_iso(),
                 "approved_by": HUB_REGISTRATION_EMAIL,
@@ -926,11 +967,23 @@ def render_hub_login() -> None:
             with st.form("hub_register_form"):
                 nome = st.text_input("Nome completo")
                 email_registro = st.text_input("E-mail corporativo ou Gmail", key="hub_register_email")
+                senha_registro = st.text_input("Senha", type="password", key="hub_register_password")
+                confirmacao_senha = st.text_input(
+                    "Confirmar senha",
+                    type="password",
+                    key="hub_register_password_confirm",
+                )
                 motivo = st.text_area("Motivo do acesso", height=90)
                 registrar = st.form_submit_button("Enviar solicitação", type="primary", use_container_width=True)
 
             if registrar:
-                ok, msg = criar_solicitacao_acesso(nome, email_registro, motivo)
+                ok, msg = criar_solicitacao_acesso(
+                    nome,
+                    email_registro,
+                    motivo,
+                    senha_registro,
+                    confirmacao_senha,
+                )
                 if ok:
                     if "não foi enviado" in msg:
                         st.warning(msg)
