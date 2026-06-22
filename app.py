@@ -1194,7 +1194,8 @@ def buscar_ineps_ubiquiti(api_key: str, apelido: str, ineps: set) -> dict:
         for inep in ineps:
             if str(inep).strip().upper() in nome:
                 status_raw = "ONLINE" if d["estado"] == "connected" else "OFFLINE"
-                out[str(inep).strip()] = {
+                inep_key = str(inep).strip()
+                out.setdefault(inep_key, []).append({
                     "Status Rede":     f"UBIQUITI - {status_raw}",
                     "Plataforma":      "UBIQUITI",
                     LAST_SEEN_COLUMN:   d["ultimo_sinal"],
@@ -1203,7 +1204,7 @@ def buscar_ineps_ubiquiti(api_key: str, apelido: str, ineps: set) -> dict:
                     "Conta":           apelido,
                     "IP Externo":      d["ip"],
                     "Nome no Console": d["nome"],
-                }
+                })
                 break
     return out
 
@@ -1704,7 +1705,7 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
 
 def deduplicar_por_inep(todos: dict) -> dict:
     """
-    Recebe dict {inep: dados} já montado e garante que cada INEP
+    Recebe dict {inep: dados} ou {inep: [dados]} e garante que cada INEP
     fique com a entrada de maior qualidade.
     Prioridade: ONLINE > tem ISP > tem IP > tem Uptime.
     INEPs '—' são ignorados (não há como deduplicar sem chave).
@@ -1720,13 +1721,26 @@ def deduplicar_por_inep(todos: dict) -> dict:
     # Agrupa candidatos por INEP
     candidatos: dict[str, list] = {}
     for inep, dados in todos.items():
-        candidatos.setdefault(inep, []).append(dados)
+        if isinstance(dados, list):
+            candidatos.setdefault(inep, []).extend(dados)
+        else:
+            candidatos.setdefault(inep, []).append(dados)
 
     resultado = {}
     for inep, lista in candidatos.items():
         melhor = max(lista, key=_score)
         resultado[inep] = melhor
     return resultado
+
+
+def adicionar_candidatos_por_inep(destino: dict, origem: dict, ineps_filtrados: set | None = None) -> None:
+    """Acumula todas as ocorrências para permitir escolher ONLINE mesmo vindo de outra conta."""
+    for inep, dados in origem.items():
+        inep_key = str(inep).strip()
+        if ineps_filtrados is not None and inep_key not in ineps_filtrados:
+            continue
+        itens = dados if isinstance(dados, list) else [dados]
+        destino.setdefault(inep_key, []).extend(itens)
 
 
 def deduplicar_df_por_inep(df: pd.DataFrame) -> tuple:
@@ -2119,7 +2133,10 @@ with t3:
                 with st.spinner(f"Consultando Ubiquiti ({len(alvo)} conta(s))..."):
                     for c in alvo:
                         try:
-                            res_bm.update(buscar_ineps_ubiquiti(c["api_key"], c["apelido"], ineps_m))
+                            adicionar_candidatos_por_inep(
+                                res_bm,
+                                buscar_ineps_ubiquiti(c["api_key"], c["apelido"], ineps_m),
+                            )
                         except Exception as e:
                             erros.append(f"Ubiquiti {c['apelido']}: {e}")
 
@@ -2127,9 +2144,7 @@ with t3:
                 try:
                     bm_omada.seek(0)
                     res_om = processar_export_omada(pd.read_excel(bm_omada))
-                    for inep, dados in res_om.items():
-                        if inep in ineps_m and inep not in res_bm:
-                            res_bm[inep] = dados
+                    adicionar_candidatos_por_inep(res_bm, res_om, ineps_m)
                 except Exception as e:
                     erros.append(f"Omada: {e}")
 
@@ -2137,9 +2152,7 @@ with t3:
                 try:
                     bm_zyxel.seek(0)
                     res_zy = processar_export_zyxel(pd.read_csv(bm_zyxel))
-                    for inep, dados in res_zy.items():
-                        if inep in ineps_m and inep not in res_bm:
-                            res_bm[inep] = dados
+                    adicionar_candidatos_por_inep(res_bm, res_zy, ineps_m)
                 except Exception as e:
                     erros.append(f"Zyxel: {e}")
 
