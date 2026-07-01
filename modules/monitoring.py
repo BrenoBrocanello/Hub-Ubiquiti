@@ -36,6 +36,17 @@ WORKFLOW_OPTIONS = [
     "Chamado aberto",
     "Gestor contatado",
     "Aguardando resposta",
+    "Classificado - Rede interna",
+    "Classificado - Rede externa",
+    "Classificado - Infraestrutura",
+    "Sem resposta",
+]
+QUICK_EVENTS = [
+    ("contact_made", "Contato feito", "Gestor contatado"),
+    ("internal_network", "Classificado: Rede interna", "Classificado - Rede interna"),
+    ("external_network", "Classificado: Rede externa", "Classificado - Rede externa"),
+    ("infrastructure", "Classificado: Infraestrutura", "Classificado - Infraestrutura"),
+    ("no_response", "Sem resposta", "Sem resposta"),
 ]
 
 
@@ -344,6 +355,9 @@ def _new_incident(state: dict, observation: dict, actor: str) -> str:
         "ticket_opened_at": "",
         "notes": "",
         "last_contact_at": "",
+        "last_event": "",
+        "last_event_at": "",
+        "last_event_by": "",
         "created_by": actor,
         "updated_at": _iso(),
     }
@@ -498,6 +512,41 @@ def _format_duration(hours: float | None) -> str:
 
 def _incident_for(state: dict, record: dict) -> dict:
     return state["incidents"].get(record.get("incident_id", ""), {})
+
+
+def _register_operational_event(
+    state: dict,
+    record: dict,
+    actor: str,
+    event_code: str,
+    event_label: str,
+    workflow: str,
+) -> bool:
+    incident = _incident_for(state, record)
+    if not incident:
+        return False
+    event_at = _iso()
+    previous_workflow = incident.get("workflow", "Sem chamado")
+    incident["workflow"] = workflow
+    incident["last_event"] = event_label
+    incident["last_event_at"] = event_at
+    incident["last_event_by"] = actor
+    incident["updated_at"] = event_at
+    if event_code in {"contact_made", "no_response"}:
+        incident["last_contact_at"] = event_at
+    _event(
+        state,
+        "operational_event",
+        actor,
+        inep=record.get("inep"),
+        source_id=record.get("source_id"),
+        incident_id=incident.get("id"),
+        event_code=event_code,
+        event_label=event_label,
+        from_status=previous_workflow,
+        to_status=workflow,
+    )
+    return True
 
 
 def _conflicting_ineps(state: dict) -> set[str]:
@@ -913,6 +962,13 @@ def _render_record_card(
             st.warning("Conflito de fontes: esta escola também aparece online em outra plataforma.")
         if incident.get("ticket_number"):
             st.success(f"Chamado {incident['ticket_number']} · {workflow}")
+        if incident.get("last_event"):
+            event_at = _parse_iso(incident.get("last_event_at"))
+            event_time = event_at.strftime("%d/%m %H:%M") if event_at else "horário não informado"
+            st.caption(
+                f"Último evento: **{incident['last_event']}** · {event_time} · "
+                f"{incident.get('last_event_by') or 'usuário'}"
+            )
 
         contact = state["contacts"].get(record.get("inep"), {})
         whatsapp_url = _whatsapp_url(contact, school)
@@ -929,6 +985,29 @@ def _render_record_card(
                 use_container_width=True,
                 key=f"wa_disabled_{record.get('source_id')}_{record.get('inep')}",
             )
+
+        with st.expander("⚡ Registrar evento rápido"):
+            st.caption("O evento muda a etapa da ocorrência e fica salvo no histórico.")
+            event_columns = st.columns(2)
+            for index, (event_code, event_label, event_workflow) in enumerate(QUICK_EVENTS):
+                if event_columns[index % 2].button(
+                    event_label,
+                    use_container_width=True,
+                    key=(
+                        f"event_{event_code}_{record.get('source_id')}_"
+                        f"{record.get('inep')}"
+                    ),
+                ):
+                    if _register_operational_event(
+                        state,
+                        record,
+                        actor,
+                        event_code,
+                        event_label,
+                        event_workflow,
+                    ):
+                        _save_state(store, state)
+                        st.rerun()
 
         with st.expander("✏️ Registrar chamado, gestor ou observação"):
             with st.form(f"monitoring_action_{record.get('source_id')}_{record.get('inep')}"):
@@ -1176,18 +1255,14 @@ def _render_bulk_contacts(state: dict, store: MonitoringStore, actor: str) -> No
                 use_container_width=True,
                 key=f"bulk_done_{record['source_id']}_{record['inep']}",
             ):
-                incident = _incident_for(state, record)
-                if incident:
-                    incident["workflow"] = "Gestor contatado"
-                    incident["last_contact_at"] = _iso()
-                    incident["updated_at"] = _iso()
-                    _event(
-                        state,
-                        "manager_contacted",
-                        actor,
-                        inep=record["inep"],
-                        incident_id=incident.get("id"),
-                    )
+                if _register_operational_event(
+                    state,
+                    record,
+                    actor,
+                    "contact_made",
+                    "Contato feito",
+                    "Gestor contatado",
+                ):
                     _save_state(store, state)
                     st.rerun()
 
@@ -1205,6 +1280,9 @@ def _render_history(state: dict) -> None:
                 "Encerramento": incident.get("closed_at"),
                 "Situação": incident.get("status"),
                 "Fluxo": incident.get("workflow"),
+                "Último evento": incident.get("last_event"),
+                "Evento em": incident.get("last_event_at"),
+                "Evento por": incident.get("last_event_by"),
                 "Chamado": incident.get("ticket_number"),
             }
         )
@@ -1216,6 +1294,33 @@ def _render_history(state: dict) -> None:
         )
     else:
         st.info("O histórico será preenchido após a primeira atualização das fontes.")
+
+    operational_events = [
+        event
+        for event in reversed(state["events"])
+        if event.get("type") == "operational_event"
+    ]
+    st.markdown("#### Linha do tempo dos eventos")
+    if operational_events:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Data": event.get("at"),
+                        "INEP": event.get("inep"),
+                        "Escola": state["schools"].get(event.get("inep"), {}).get("name", ""),
+                        "Evento": event.get("event_label"),
+                        "Plataforma": event.get("source_id"),
+                        "Responsável": event.get("actor"),
+                    }
+                    for event in operational_events
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.caption("Nenhum evento operacional registrado.")
 
     st.markdown("#### Contatos cadastrados")
     contact_rows = []
