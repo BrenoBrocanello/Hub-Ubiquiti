@@ -512,6 +512,22 @@ def _conflicting_ineps(state: dict) -> set[str]:
     }
 
 
+def _confirmed_offline_ineps(state: dict) -> set[str]:
+    """INEPs cuja situação atual é OFFLINE em todas as fontes conhecidas."""
+    grouped: dict[str, list[dict]] = {}
+    for record in state["current"].values():
+        grouped.setdefault(record.get("inep", ""), []).append(record)
+
+    confirmed = set()
+    for inep, records in grouped.items():
+        if not inep or any(record.get("stale") for record in records):
+            continue
+        statuses = {record.get("status", "") for record in records}
+        if statuses == {"OFFLINE"}:
+            confirmed.add(inep)
+    return confirmed
+
+
 def _remove_unwanted_ubiquiti_sources(state: dict, allowed_sources: set[str]) -> bool:
     """Remove dados criados quando o módulo consultava contas Ubiquiti fora de SP/CE."""
     unwanted_sources = {
@@ -789,6 +805,7 @@ def _render_freshness(state: dict) -> None:
 
 
 def _render_metrics(state: dict, records: list[dict]) -> None:
+    confirmed_offline = _confirmed_offline_ineps(state)
     critical = 0
     within = 0
     ticketed = 0
@@ -798,6 +815,8 @@ def _render_metrics(state: dict, records: list[dict]) -> None:
             continue
         incident = _incident_for(state, record)
         if record.get("status") == "OFFLINE":
+            if record.get("inep") not in confirmed_offline:
+                continue
             if incident.get("workflow", "Sem chamado") != "Sem chamado":
                 ticketed += 1
             elif (_record_age(record) or 0) >= SLA_HOURS:
@@ -992,6 +1011,7 @@ def _render_queue(state: dict, store: MonitoringStore, actor: str) -> None:
         if record.get("status") in ACTIVE_STATUSES
     ]
     conflicts = _conflicting_ineps(state)
+    confirmed_offline = _confirmed_offline_ineps(state)
     _render_metrics(state, records)
 
     st.markdown("#### O que precisa da sua atenção")
@@ -1010,7 +1030,8 @@ def _render_queue(state: dict, store: MonitoringStore, actor: str) -> None:
     )
     view_help = {
         "Ação necessária": (
-            "Escolas totalmente offline e ainda sem chamado. As mais antigas aparecem primeiro."
+            "Somente escolas confirmadas 100% offline em todas as fontes e ainda sem chamado. "
+            "As mais antigas aparecem primeiro."
         ),
         "Em atendimento": (
             "Ocorrências que já possuem chamado ou contato em andamento."
@@ -1041,6 +1062,11 @@ def _render_queue(state: dict, store: MonitoringStore, actor: str) -> None:
 
     filtered = []
     for record in records:
+        if (
+            record.get("status") == "OFFLINE"
+            and record.get("inep") not in confirmed_offline
+        ):
+            continue
         incident = _incident_for(state, record)
         workflow = incident.get("workflow", "Sem chamado")
         is_exception = bool(record.get("exception") or record.get("stale"))
@@ -1097,9 +1123,13 @@ def _render_queue(state: dict, store: MonitoringStore, actor: str) -> None:
 
 
 def _render_bulk_contacts(state: dict, store: MonitoringStore, actor: str) -> None:
+    confirmed_offline = _confirmed_offline_ineps(state)
     records = [
         record for record in state["current"].values()
-        if record.get("status") == "OFFLINE" and not record.get("stale")
+        if record.get("status") == "OFFLINE"
+        and not record.get("stale")
+        and not record.get("exception")
+        and record.get("inep") in confirmed_offline
     ]
     options = {}
     for record in sorted(records, key=lambda item: _priority(state, item)):
@@ -1208,17 +1238,30 @@ def _render_history(state: dict) -> None:
 
 def _render_quality(state: dict) -> None:
     conflicts = _conflicting_ineps(state)
+    confirmed_offline = _confirmed_offline_ineps(state)
+    reported_offline = {
+        record.get("inep", "")
+        for record in state["current"].values()
+        if record.get("status") == "OFFLINE"
+    }
+    unconfirmed_offline = reported_offline - confirmed_offline
     stale = [record for record in state["current"].values() if record.get("stale")]
     latest = list(reversed(state["imports"][-20:]))
-    metrics = st.columns(3)
+    metrics = st.columns(4)
     metrics[0].metric("Conflitos de fontes", len(conflicts))
-    metrics[1].metric("Registros desatualizados", len(stale))
-    metrics[2].metric(
+    metrics[1].metric("Offline não confirmado", len(unconfirmed_offline))
+    metrics[2].metric("Registros desatualizados", len(stale))
+    metrics[3].metric(
         "Linhas ignoradas",
         sum(int(item.get("ignored", 0)) for item in latest),
     )
     if conflicts:
         st.warning("INEPs online e offline simultaneamente: " + ", ".join(sorted(conflicts)))
+    if unconfirmed_offline:
+        st.caption(
+            "Removidos da fila por não estarem 100% offline em todas as fontes: " +
+            ", ".join(sorted(unconfirmed_offline))
+        )
     if stale:
         st.caption(
             "Registros ausentes no último arquivo da respectiva fonte: " +
