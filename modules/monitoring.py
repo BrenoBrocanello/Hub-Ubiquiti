@@ -512,6 +512,52 @@ def _conflicting_ineps(state: dict) -> set[str]:
     }
 
 
+def _remove_unwanted_ubiquiti_sources(state: dict, allowed_sources: set[str]) -> bool:
+    """Remove dados criados quando o módulo consultava contas Ubiquiti fora de SP/CE."""
+    unwanted_sources = {
+        record.get("source_id", "")
+        for record in state["current"].values()
+        if str(record.get("source_id", "")).startswith("UBIQUITI:")
+        and record.get("source_id") not in allowed_sources
+    }
+    unwanted_sources.update(
+        {
+            incident.get("source_id", "")
+            for incident in state["incidents"].values()
+            if str(incident.get("source_id", "")).startswith("UBIQUITI:")
+            and incident.get("source_id") not in allowed_sources
+        }
+    )
+    if not unwanted_sources:
+        return False
+
+    removed_incident_ids = {
+        incident_id
+        for incident_id, incident in state["incidents"].items()
+        if incident.get("source_id") in unwanted_sources
+    }
+    state["current"] = {
+        key: record
+        for key, record in state["current"].items()
+        if record.get("source_id") not in unwanted_sources
+    }
+    state["incidents"] = {
+        key: incident
+        for key, incident in state["incidents"].items()
+        if key not in removed_incident_ids
+    }
+    state["imports"] = [
+        item for item in state["imports"]
+        if item.get("source_id") not in unwanted_sources
+    ]
+    state["events"] = [
+        event for event in state["events"]
+        if event.get("source_id") not in unwanted_sources
+        and event.get("incident_id") not in removed_incident_ids
+    ]
+    return True
+
+
 def _priority(state: dict, record: dict) -> tuple:
     incident = _incident_for(state, record)
     age = _record_age(record)
@@ -608,7 +654,7 @@ def _render_imports(
     with st.expander("🔄 Atualizar monitoramento", expanded=True):
         st.markdown(
             "**1. Selecione os exports mais recentes.** Ao atualizar, o Hub também consulta "
-            "automaticamente todas as contas Ubiquiti configuradas no Hub e mantém "
+            "automaticamente apenas as contas Ubiquiti Conta_SP e Conta_CE e mantém "
             "somente as escolas de SP e CE."
         )
         col_omada, col_zyxel = st.columns(2)
@@ -691,7 +737,7 @@ def _render_imports(
                         warnings.append(f"Ubiquiti não atualizado: {exc}")
                 else:
                     warnings.append(
-                        "Nenhuma conta Ubiquiti está configurada no Hub."
+                        "As contas Ubiquiti Conta_SP e Conta_CE não foram encontradas."
                     )
 
                 if updated_any:
@@ -1219,6 +1265,16 @@ def render_monitoring(
         st.session_state.monitoring_backend = store.backend
         st.session_state.monitoring_store_warning = store.last_warning
     state = st.session_state.monitoring_state
+    allowed_ubiquiti_sources = {
+        f"UBIQUITI:{_clean(account.get('apelido'))}"
+        for account in ubiquiti_accounts
+        if _clean(account.get("apelido"))
+    }
+    if _remove_unwanted_ubiquiti_sources(state, allowed_ubiquiti_sources):
+        st.session_state.monitoring_state = state
+        _, cleanup_message = store.save(state)
+        st.session_state.monitoring_backend = store.backend
+        st.session_state.monitoring_cleanup_message = cleanup_message
 
     title_col, action_col = st.columns([5, 1])
     with title_col:
@@ -1234,6 +1290,9 @@ def render_monitoring(
     warning = st.session_state.pop("monitoring_store_warning", "")
     if warning:
         st.warning(warning)
+    cleanup_message = st.session_state.pop("monitoring_cleanup_message", "")
+    if cleanup_message:
+        st.info("Dados Ubiquiti fora de Conta_SP/Conta_CE foram removidos. " + cleanup_message)
     backend = st.session_state.get("monitoring_backend", "local")
     if backend == "local":
         st.caption("Armazenamento atual: local. Configure a tabela do Supabase para persistência em nuvem.")

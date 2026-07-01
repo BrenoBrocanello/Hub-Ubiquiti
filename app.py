@@ -2251,8 +2251,13 @@ with t4:
 # ABA 5 — MONITORAMENTO
 # ─────────────────────────────────────────
 with t5:
+    contas_ubiquiti_monitoramento = [
+        conta
+        for conta in validas
+        if str(conta.get("apelido", "")).strip().casefold() in {"conta_sp", "conta_ce"}
+    ]
     render_monitoring(
-        ubiquiti_accounts=validas,
+        ubiquiti_accounts=contas_ubiquiti_monitoramento,
         collect_ubiquiti=coletar_todos_hosts_ubiquiti,
         actor=st.session_state.hub_user_email,
         configured_password=obter_config(
