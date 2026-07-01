@@ -48,6 +48,11 @@ QUICK_EVENTS = [
     ("infrastructure", "Classificado: Infraestrutura", "Classificado - Infraestrutura"),
     ("no_response", "Sem resposta", "Sem resposta"),
 ]
+CLASSIFIED_WORKFLOWS = {
+    "Classificado - Rede interna",
+    "Classificado - Rede externa",
+    "Classificado - Infraestrutura",
+}
 
 
 def _now() -> datetime:
@@ -514,6 +519,10 @@ def _incident_for(state: dict, record: dict) -> dict:
     return state["incidents"].get(record.get("incident_id", ""), {})
 
 
+def _is_classified(incident: dict) -> bool:
+    return incident.get("workflow", "") in CLASSIFIED_WORKFLOWS
+
+
 def _register_operational_event(
     state: dict,
     record: dict,
@@ -866,6 +875,8 @@ def _render_metrics(state: dict, records: list[dict]) -> None:
         if record.get("status") == "OFFLINE":
             if record.get("inep") not in confirmed_offline:
                 continue
+            if _is_classified(incident):
+                continue
             if incident.get("workflow", "Sem chamado") != "Sem chamado":
                 ticketed += 1
             elif (_record_age(record) or 0) >= SLA_HOURS:
@@ -1099,6 +1110,7 @@ def _render_queue(state: dict, store: MonitoringStore, actor: str) -> None:
         [
             "Ação necessária",
             "Em atendimento",
+            "Classificados",
             "Outros sinais",
             "Exceções",
             "Tudo",
@@ -1113,7 +1125,10 @@ def _render_queue(state: dict, store: MonitoringStore, actor: str) -> None:
             "As mais antigas aparecem primeiro."
         ),
         "Em atendimento": (
-            "Ocorrências que já possuem chamado ou contato em andamento."
+            "Ocorrências que já possuem chamado, contato ou aguardam resposta."
+        ),
+        "Classificados": (
+            "Ocorrências já direcionadas para Rede interna, Rede externa ou Infraestrutura."
         ),
         "Outros sinais": (
             "Degradações parciais, alertas e escolas sem dispositivos. Não entram no SLA principal."
@@ -1148,22 +1163,31 @@ def _render_queue(state: dict, store: MonitoringStore, actor: str) -> None:
             continue
         incident = _incident_for(state, record)
         workflow = incident.get("workflow", "Sem chamado")
+        is_classified = _is_classified(incident)
         is_exception = bool(record.get("exception") or record.get("stale"))
         if view == "Ação necessária" and not (
             record.get("status") == "OFFLINE"
             and workflow == "Sem chamado"
             and not is_exception
+            and not is_classified
         ):
             continue
         if view == "Em atendimento" and not (
             record.get("status") == "OFFLINE"
             and workflow != "Sem chamado"
             and not is_exception
+            and not is_classified
+        ):
+            continue
+        if view == "Classificados" and not (
+            is_classified
+            and not is_exception
         ):
             continue
         if view == "Outros sinais" and not (
             record.get("status") in {"DEGRADED", "ALERTA", "SEM_DISPOSITIVO"}
             and not is_exception
+            and not is_classified
         ):
             continue
         if view == "Exceções" and not is_exception:
@@ -1209,6 +1233,7 @@ def _render_bulk_contacts(state: dict, store: MonitoringStore, actor: str) -> No
         and not record.get("stale")
         and not record.get("exception")
         and record.get("inep") in confirmed_offline
+        and not _is_classified(_incident_for(state, record))
     ]
     options = {}
     for record in sorted(records, key=lambda item: _priority(state, item)):
