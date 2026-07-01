@@ -599,80 +599,112 @@ def _render_imports(
     ubiquiti_accounts: list,
     collect_ubiquiti,
 ) -> None:
-    with st.expander("Atualizar fontes de monitoramento", expanded=not bool(state["imports"])):
-        st.caption(
-            "Importe Omada e Zyxel juntos ou separadamente. A consulta Ubiquiti considera "
-            "somente INEPs de SP e CE."
+    flash = st.session_state.pop("monitoring_update_flash", None)
+    if flash:
+        st.success(flash.get("message", "Monitoramento atualizado."))
+        if flash.get("warnings"):
+            st.warning(" | ".join(flash["warnings"]))
+
+    with st.expander("🔄 Atualizar monitoramento", expanded=True):
+        st.markdown(
+            "**1. Selecione os exports mais recentes.** Ao atualizar, o Hub também consulta "
+            "automaticamente todas as contas Ubiquiti configuradas no Hub e mantém "
+            "somente as escolas de SP e CE."
         )
         col_omada, col_zyxel = st.columns(2)
         with col_omada:
             omada_file = st.file_uploader(
-                "Export Omada (.xlsx)",
+                "Omada (.xlsx)",
                 type=["xlsx"],
                 key="monitoring_omada_upload",
+                help="Export Organization List do Omada.",
             )
         with col_zyxel:
             zyxel_file = st.file_uploader(
-                "Export Zyxel (.csv)",
+                "Zyxel (.csv)",
                 type=["csv"],
                 key="monitoring_zyxel_upload",
+                help="Export Overview > Sites do Zyxel Nebula.",
             )
 
-        action_col, api_col = st.columns(2)
-        if action_col.button(
-            "Processar exports",
+        st.caption(
+            "Você pode atualizar apenas um export, mas o ideal é enviar os dois juntos. "
+            "Ubiquiti não precisa de arquivo nem de um botão separado."
+        )
+        if st.button(
+            "Atualizar monitoramento",
             type="primary",
             use_container_width=True,
             disabled=not (omada_file or zyxel_file),
         ):
             new_state = state
             summaries = []
-            try:
+            warnings = []
+            updated_any = False
+            with st.status("Atualizando as fontes...", expanded=True) as status_box:
                 if omada_file:
-                    omada_file.seek(0)
-                    observations, metadata = parse_omada_export(pd.read_excel(omada_file))
-                    new_state = apply_source_snapshot(
-                        new_state, "OMADA", observations, actor, metadata=metadata
-                    )
-                    summaries.append(f"Omada: {len(observations)} escolas SP/CE")
-                if zyxel_file:
-                    zyxel_file.seek(0)
-                    observations, metadata = parse_zyxel_export(pd.read_csv(zyxel_file))
-                    new_state = apply_source_snapshot(
-                        new_state, "ZYXEL", observations, actor, metadata=metadata
-                    )
-                    summaries.append(f"Zyxel: {len(observations)} escolas SP/CE")
-                _save_state(store, new_state)
-                st.success(" · ".join(summaries))
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Não foi possível processar os exports: {exc}")
-
-        if api_col.button(
-            "Consultar Ubiquiti SP/CE",
-            use_container_width=True,
-            disabled=not bool(ubiquiti_accounts),
-        ):
-            try:
-                with st.spinner("Consultando contas Ubiquiti..."):
-                    rows, errors = collect_ubiquiti(ubiquiti_accounts)
-                    grouped = parse_ubiquiti_rows(rows)
-                    new_state = state
-                    for source_id, observations in grouped.items():
+                    status_box.write("Lendo o export Omada...")
+                    try:
+                        omada_file.seek(0)
+                        observations, metadata = parse_omada_export(pd.read_excel(omada_file))
                         new_state = apply_source_snapshot(
-                            new_state,
-                            source_id,
-                            observations,
-                            actor,
-                            metadata={"total": len(observations), "ignored": []},
+                            new_state, "OMADA", observations, actor, metadata=metadata
                         )
+                        summaries.append(f"Omada: {len(observations)} escolas")
+                        updated_any = True
+                    except Exception as exc:
+                        warnings.append(f"Omada não atualizado: {exc}")
+                if zyxel_file:
+                    status_box.write("Lendo o export Zyxel...")
+                    try:
+                        zyxel_file.seek(0)
+                        observations, metadata = parse_zyxel_export(pd.read_csv(zyxel_file))
+                        new_state = apply_source_snapshot(
+                            new_state, "ZYXEL", observations, actor, metadata=metadata
+                        )
+                        summaries.append(f"Zyxel: {len(observations)} escolas")
+                        updated_any = True
+                    except Exception as exc:
+                        warnings.append(f"Zyxel não atualizado: {exc}")
+
+                status_box.write("Consultando Ubiquiti automaticamente...")
+                if ubiquiti_accounts:
+                    try:
+                        rows, api_errors = collect_ubiquiti(ubiquiti_accounts)
+                        grouped = parse_ubiquiti_rows(rows)
+                        for source_id, observations in grouped.items():
+                            new_state = apply_source_snapshot(
+                                new_state,
+                                source_id,
+                                observations,
+                                actor,
+                                metadata={"total": len(observations), "ignored": []},
+                            )
+                        ubiquiti_total = sum(len(items) for items in grouped.values())
+                        summaries.append(f"Ubiquiti: {ubiquiti_total} escolas")
+                        updated_any = True
+                        if api_errors:
+                            warnings.append(
+                                "Algumas contas Ubiquiti falharam: " + " | ".join(api_errors)
+                            )
+                    except Exception as exc:
+                        warnings.append(f"Ubiquiti não atualizado: {exc}")
+                else:
+                    warnings.append(
+                        "Nenhuma conta Ubiquiti está configurada no Hub."
+                    )
+
+                if updated_any:
+                    status_box.update(label="Atualização concluída", state="complete")
                     _save_state(store, new_state)
-                if errors:
-                    st.warning("Algumas contas falharam: " + " | ".join(errors))
-                st.success(f"Ubiquiti: {sum(len(items) for items in grouped.values())} escolas SP/CE.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Falha na consulta Ubiquiti: {exc}")
+                    st.session_state.monitoring_update_flash = {
+                        "message": "Monitoramento atualizado — " + " · ".join(summaries),
+                        "warnings": warnings,
+                    }
+                    st.rerun()
+                else:
+                    status_box.update(label="Nenhuma fonte pôde ser atualizada", state="error")
+                    st.error(" | ".join(warnings))
 
 
 def _latest_imports(state: dict) -> dict[str, dict]:
@@ -687,7 +719,10 @@ def _latest_imports(state: dict) -> dict[str, dict]:
 def _render_freshness(state: dict) -> None:
     latest = _latest_imports(state)
     if not latest:
-        st.info("Nenhuma fonte atualizada. Importe os exports ou consulte o Ubiquiti.")
+        st.info(
+            "Comece selecionando os exports Omada/Zyxel e clique em "
+            "**Atualizar monitoramento**. O Ubiquiti será consultado automaticamente."
+        )
         return
     parts = []
     stale_sources = []
@@ -816,22 +851,21 @@ def _render_record_card(
 
         contact = state["contacts"].get(record.get("inep"), {})
         whatsapp_url = _whatsapp_url(contact, school)
-        action_cols = st.columns(2)
         if whatsapp_url:
-            action_cols[0].link_button(
-                "Abrir WhatsApp",
+            st.link_button(
+                "💬 Abrir WhatsApp do gestor",
                 whatsapp_url,
                 use_container_width=True,
             )
         else:
-            action_cols[0].button(
-                "WhatsApp sem cadastro",
+            st.button(
+                "Cadastre o gestor para habilitar o WhatsApp",
                 disabled=True,
                 use_container_width=True,
                 key=f"wa_disabled_{record.get('source_id')}_{record.get('inep')}",
             )
 
-        with st.expander("Atualizar atendimento e cadastro"):
+        with st.expander("✏️ Registrar chamado, gestor ou observação"):
             with st.form(f"monitoring_action_{record.get('source_id')}_{record.get('inep')}"):
                 name = st.text_input("Nome oficial da escola", value=school.get("name", ""))
                 municipality = st.text_input(
@@ -914,10 +948,41 @@ def _render_queue(state: dict, store: MonitoringStore, actor: str) -> None:
     conflicts = _conflicting_ineps(state)
     _render_metrics(state, records)
 
-    filter_cols = st.columns([1.3, 1, 1, 1.4])
+    st.markdown("#### O que precisa da sua atenção")
+    view = st.radio(
+        "Visão da fila",
+        [
+            "Ação necessária",
+            "Em atendimento",
+            "Outros sinais",
+            "Exceções",
+            "Tudo",
+        ],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="monitoring_queue_view",
+    )
+    view_help = {
+        "Ação necessária": (
+            "Escolas totalmente offline e ainda sem chamado. As mais antigas aparecem primeiro."
+        ),
+        "Em atendimento": (
+            "Ocorrências que já possuem chamado ou contato em andamento."
+        ),
+        "Outros sinais": (
+            "Degradações parciais, alertas e escolas sem dispositivos. Não entram no SLA principal."
+        ),
+        "Exceções": (
+            "Obras, renegociação, inviabilidade ou dados que desapareceram do último export."
+        ),
+        "Tudo": "Todas as ocorrências abertas, ainda ordenadas por prioridade.",
+    }
+    st.caption(view_help[view])
+
+    filter_cols = st.columns([2, 1, 1])
     search = filter_cols[0].text_input(
         "Buscar",
-        placeholder="INEP, escola ou município",
+        placeholder="INEP, escola ou município...",
         key="monitoring_search",
     )
     uf_filter = filter_cols[1].multiselect("UF", ["SP", "CE"], default=["SP", "CE"])
@@ -927,16 +992,32 @@ def _render_queue(state: dict, store: MonitoringStore, actor: str) -> None:
         platform_options,
         default=platform_options,
     )
-    status_options = ["OFFLINE", "DEGRADED", "ALERTA", "SEM_DISPOSITIVO"]
-    status_filter = filter_cols[3].multiselect(
-        "Situação",
-        status_options,
-        default=status_options,
-        format_func=lambda value: STATUS_LABELS.get(value, value),
-    )
 
     filtered = []
     for record in records:
+        incident = _incident_for(state, record)
+        workflow = incident.get("workflow", "Sem chamado")
+        is_exception = bool(record.get("exception") or record.get("stale"))
+        if view == "Ação necessária" and not (
+            record.get("status") == "OFFLINE"
+            and workflow == "Sem chamado"
+            and not is_exception
+        ):
+            continue
+        if view == "Em atendimento" and not (
+            record.get("status") == "OFFLINE"
+            and workflow != "Sem chamado"
+            and not is_exception
+        ):
+            continue
+        if view == "Outros sinais" and not (
+            record.get("status") in {"DEGRADED", "ALERTA", "SEM_DISPOSITIVO"}
+            and not is_exception
+        ):
+            continue
+        if view == "Exceções" and not is_exception:
+            continue
+
         school = state["schools"].get(record.get("inep"), {})
         haystack = " ".join(
             [
@@ -952,14 +1033,15 @@ def _render_queue(state: dict, store: MonitoringStore, actor: str) -> None:
             continue
         if record.get("platform") not in platform_filter:
             continue
-        if record.get("status") not in status_filter:
-            continue
         filtered.append(record)
 
     filtered.sort(key=lambda record: _priority(state, record))
-    st.caption(f"{len(filtered)} ocorrência(s) exibida(s), ordenadas por prioridade operacional.")
+    st.caption(f"{len(filtered)} ocorrência(s) nesta visão.")
     if not filtered:
-        st.success("Nenhuma ocorrência corresponde aos filtros atuais.")
+        if view == "Ação necessária":
+            st.success("Nenhuma escola offline está aguardando abertura de chamado.")
+        else:
+            st.info("Nenhuma ocorrência corresponde a esta visão e aos filtros atuais.")
         return
 
     columns = st.columns(2)
@@ -1142,8 +1224,7 @@ def render_monitoring(
     with title_col:
         st.markdown("### 📡 Central de Monitoramento")
         st.caption(
-            "Triagem de indisponibilidade · SLA de 4 horas · SP e CE · "
-            "Omada, Zyxel e Ubiquiti"
+            "Veja primeiro quem precisa de ação, registre o chamado e depois contate o gestor."
         )
     with action_col:
         if st.button("Sair do módulo", use_container_width=True):
@@ -1159,10 +1240,14 @@ def render_monitoring(
     else:
         st.caption("Armazenamento atual: Supabase sincronizado.")
 
+    st.info(
+        "**Fluxo rápido:** 1️⃣ envie os exports · 2️⃣ atualize as três plataformas · "
+        "3️⃣ atenda a fila da ocorrência mais antiga para a mais recente"
+    )
     _render_imports(state, store, actor, ubiquiti_accounts, collect_ubiquiti)
     _render_freshness(state)
     queue_tab, bulk_tab, history_tab, quality_tab = st.tabs(
-        ["Fila operacional", "Contatos em massa", "Histórico e contatos", "Qualidade dos dados"]
+        ["🚨 Fila de prioridade", "💬 WhatsApp em lote", "🗂️ Histórico", "⚠️ Pendências dos dados"]
     )
     with queue_tab:
         _render_queue(state, store, actor)

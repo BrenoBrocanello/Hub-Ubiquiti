@@ -2252,7 +2252,7 @@ with t4:
 # ─────────────────────────────────────────
 with t5:
     render_monitoring(
-        ubiquiti_accounts=alvo,
+        ubiquiti_accounts=validas,
         collect_ubiquiti=coletar_todos_hosts_ubiquiti,
         actor=st.session_state.hub_user_email,
         configured_password=obter_config(

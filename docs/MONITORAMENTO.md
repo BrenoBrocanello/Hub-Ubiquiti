@@ -47,13 +47,13 @@ efêmeras, o Supabase é obrigatório para não perder o histórico.
 
 ## Fluxo recomendado
 
-1. Atualize Omada e Zyxel pelo menos uma vez por hora.
-2. Consulte o Ubiquiti.
-3. Atenda a fila `Ação imediata` da ocorrência mais antiga para a mais recente.
+1. Selecione os exports Omada e Zyxel mais recentes.
+2. Clique em `Atualizar monitoramento`; a consulta Ubiquiti de SP/CE ocorre automaticamente.
+3. Abra `Ação necessária` e atenda da ocorrência mais antiga para a mais recente.
 4. Registre o número do chamado e a etapa do atendimento.
 5. Cadastre o nome oficial da escola e o gestor antes de abrir o WhatsApp.
 6. Use a fila de contatos em massa uma conversa por vez.
-7. Revise `Qualidade dos dados` para conflitos, registros ausentes e linhas ignoradas.
+7. Revise `Pendências dos dados` para conflitos, registros ausentes e linhas ignoradas.
 
 ## Cadastro escolar
 
