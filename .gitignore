@@ -8,4 +8,5 @@ __pycache__/
 .env
 data/fechamentos_diarios/
 data/solicitacoes_acesso.json
+data/monitoring_state.json
 streamlit*.log

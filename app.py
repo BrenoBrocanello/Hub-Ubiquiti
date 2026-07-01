@@ -19,6 +19,7 @@ from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
 from modules.daily_report import render_daily_closing_admin, render_daily_report
+from modules.monitoring import render_monitoring
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
@@ -1089,6 +1090,7 @@ for k, v in {
     "inv_ultima_coleta": None,
     "daily_report_current": None,
     "daily_report_authenticated": False,
+    "monitoring_authenticated": False,
 }.items():
     if k not in st.session_state:
         if k == "contas":
@@ -1793,6 +1795,7 @@ with st.sidebar:
         st.session_state.hub_authenticated = False
         st.session_state.hub_user_email = ""
         st.session_state.daily_report_authenticated = False
+        st.session_state.monitoring_authenticated = False
         st.rerun()
 
     st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
@@ -1856,11 +1859,12 @@ st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
 # ═══════════════════════════════════════════════════════════════
 # ABAS
 # ═══════════════════════════════════════════════════════════════
-t1, t2, t3, t4, t5, t6 = st.tabs([
+t1, t2, t3, t4, t5, t6, t7 = st.tabs([
     "📄 Relatório Diário",
     "🌐 Inventário Geral",
     "🔍 Busca Manual",
     "🛠️ Dados das contas",
+    "📡 Monitoramento",
     "🩺 Diagnóstico das API´S",
     "ℹ️ Ajuda",
 ])
@@ -1957,15 +1961,29 @@ with t2:
                         log_inv.append(("err", f"Zyxel: {e}"))
 
                 if todas_linhas:
-                    df_inv = pd.DataFrame(todas_linhas)
+                    # DataFrame com todas as linhas coletadas (antes da deduplicação)
+                    df_full = pd.DataFrame(todas_linhas)
 
-                    # Deduplicação centralizada
-                    df_inv, removidos = deduplicar_df_por_inep(df_inv)
+                    # Coluna agregada por INEP: considera ONLINE se alguma conta reportou ONLINE
+                    def _any_online(series):
+                        return series.dropna().astype(str).str.upper().str.contains("ONLINE").any()
+
+                    try:
+                        agg_status = (
+                            df_full.groupby("INEP")["Status Rede"]
+                            .apply(lambda s: "AGREGADO - ONLINE" if _any_online(s) else "AGREGADO - OFFLINE")
+                        )
+                        df_full["Status Agregado"] = df_full["INEP"].map(agg_status)
+                    except Exception:
+                        df_full["Status Agregado"] = ""
+
+                    # Deduplicação centralizada (mantém apenas uma linha por INEP)
+                    df_inv, removidos = deduplicar_df_por_inep(df_full)
                     if removidos > 0:
                         log_inv.append(("ok", f"Deduplicação: {removidos} duplicata(s) removida(s)"))
 
                     # Garante ordem das colunas
-                    col_order = ["INEP","Nome no Console","Status Rede","Plataforma",
+                    col_order = ["INEP","Nome no Console","Status Rede","Status Agregado","Plataforma",
                                  LAST_SEEN_COLUMN,"Uptime WAN","ISP","Conta","IP Externo"]
                     df_inv = df_inv[[c for c in col_order if c in df_inv.columns] +
                                     [c for c in df_inv.columns if c not in col_order]]
@@ -2230,9 +2248,32 @@ with t4:
                 st.info("Selecione uma conta e clique em 'Sondar'.")
 
 # ─────────────────────────────────────────
-# ABA 5 — DIAGNÓSTICO
+# ABA 5 — MONITORAMENTO
 # ─────────────────────────────────────────
 with t5:
+    render_monitoring(
+        ubiquiti_accounts=alvo,
+        collect_ubiquiti=coletar_todos_hosts_ubiquiti,
+        actor=st.session_state.hub_user_email,
+        configured_password=obter_config(
+            ("monitoring", "password"),
+            "monitoring_password",
+            "MONITORING_PASSWORD",
+            default="",
+        ),
+        supabase_request=supabase_request,
+        supabase_enabled=supabase_ativo(),
+        supabase_table=obter_config(
+            ("supabase", "monitoring_table"),
+            "supabase_monitoring_table",
+            default="hub_monitoring_state",
+        ),
+    )
+
+# ─────────────────────────────────────────
+# ABA 6 — DIAGNÓSTICO
+# ─────────────────────────────────────────
+with t6:
     if not alvo:
         st.warning("Selecione pelo menos uma conta na barra lateral.")
     else:
@@ -2251,9 +2292,9 @@ with t5:
             st.markdown(f"- **{c['apelido']}** — `{prev}`")
 
 # ─────────────────────────────────────────
-# ABA 6 — AJUDA
+# ABA 7 — AJUDA
 # ─────────────────────────────────────────
-with t6:
+with t7:
     st.markdown("### Como usar o Hub Redes — EACE")
     st.markdown("""
 **Relatório Diário:**
@@ -2269,6 +2310,13 @@ with t6:
 - Omada e Zyxel: faça upload dos exports na aba Inventário
 - Campo de pesquisa por INEP ou nome da escola
 - Exportação filtrada ou completa em .xlsx
+
+**Central de Monitoramento:**
+- Área protegida para acompanhamento operacional de SP e CE
+- SLA de 4 horas com prioridade para as quedas mais antigas
+- Omada usa o campo Last Uptime; Zyxel usa a primeira detecção persistida
+- Registre chamado, gestor, telefone e etapa do atendimento em cada ocorrência
+- Use Qualidade dos dados para revisar conflitos e registros desatualizados
 
 **Como exportar o Zyxel:**
 Zyxel Nebula → Overview → aba Sites → ícone de download (CSV) no canto superior direito.
