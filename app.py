@@ -2198,54 +2198,143 @@ with t3:
                 st.error("Nenhum INEP localizado em nenhuma das fontes consultadas.")
 
 # ─────────────────────────────────────────
-# ABA 4 — RAIO-X
+# ABA 4 — DADOS DAS CONTAS
 # ─────────────────────────────────────────
 with t4:
-    if not alvo:
-        st.warning("Selecione pelo menos uma conta na barra lateral.")
-    else:
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            conta_rx = st.selectbox("Conta:", [c["apelido"] for c in alvo])
-            filtro   = st.text_input("Filtrar por nome/INEP:", placeholder="Ex: FEIJÓ ou 12131229")
-            btn      = st.button("🔬 Sondar", type="primary", use_container_width=True)
-        with c2:
-            if btn:
-                key_rx = next(c["api_key"] for c in alvo if c["apelido"] == conta_rx)
-                with st.spinner(f"Carregando hosts de '{conta_rx}'..."):
-                    try:
-                        hosts = get_paginated_hosts(key_rx)
-                        rows  = []
-                        for h in hosts:
-                            d = extrair_host(h)
-                            rows.append({
-                                "Nome": d["nome"],
-                                "Estado": d["estado"],
-                                LAST_SEEN_COLUMN: d["ultimo_sinal"],
-                                "IP": d["ip"],
-                                "ISP": d["isp"],
-                                "Uptime": d["uptime"],
-                            })
-                        rx_columns = ["Nome", "Estado", LAST_SEEN_COLUMN, "IP", "ISP", "Uptime"]
-                        df_rx = pd.DataFrame(rows, columns=rx_columns)
-                        if filtro:
-                            df_rx = df_rx[df_rx["Nome"].str.upper().str.contains(filtro.upper(), na=False)]
-                        m1, m2, m3 = st.columns(3)
-                        m1.metric("Total hosts", len(df_rx))
-                        m2.metric("Conectados",  (df_rx["Estado"] == "connected").sum())
-                        m3.metric("Offline",     (df_rx["Estado"] == "disconnected").sum())
-                        if df_rx.empty:
-                            st.info("Nenhum host encontrado para esta conta/filtro.")
-                        else:
-                            st.dataframe(df_rx.style.map(cor_estado, subset=["Estado"]),
-                                         use_container_width=True, height=440)
-                        st.download_button("⬇️ Exportar", to_xlsx(df_rx),
-                            f"raio_x_{conta_rx}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                    except Exception as e:
-                        st.error(f"Erro: {e}")
-            else:
-                st.info("Selecione uma conta e clique em 'Sondar'.")
+    st.markdown("#### Consultar dados por plataforma")
+    st.caption(
+        "Escolha uma conta Ubiquiti ou selecione **Nenhum** para consultar somente "
+        "os exports Omada e/ou Zyxel."
+    )
+
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        conta_rx = st.selectbox(
+            "Conta:",
+            ["Nenhum"] + [c["apelido"] for c in alvo],
+            help="Selecione Nenhum caso queira importar somente Omada ou Zyxel.",
+        )
+        filtro = st.text_input(
+            "Filtrar por nome/INEP:",
+            placeholder="Ex: FEIJÓ ou 12131229",
+        )
+
+    with c2:
+        col_om_rx, col_zy_rx = st.columns(2)
+        with col_om_rx:
+            st.caption("🔵 **Omada** — export do portal On Premise Systems")
+            rx_omada = st.file_uploader(
+                "Export Omada (.xlsx)",
+                type=["xlsx"],
+                key="rx_omada",
+            )
+        with col_zy_rx:
+            st.caption("🟣 **Zyxel** — export CSV do Nebula (Overview → Sites)")
+            rx_zyxel = st.file_uploader(
+                "Export Zyxel (.csv)",
+                type=["csv"],
+                key="rx_zyxel",
+            )
+
+    tem_fonte_rx = conta_rx != "Nenhum" or rx_omada or rx_zyxel
+    btn = st.button(
+        "🔬 Sondar",
+        type="primary",
+        use_container_width=True,
+        disabled=not tem_fonte_rx,
+    )
+
+    if not tem_fonte_rx:
+        st.info("Selecione uma conta Ubiquiti ou importe um export Omada/Zyxel.")
+    elif btn:
+        rows_rx = []
+        erros_rx = []
+
+        if conta_rx != "Nenhum":
+            conta_ubiquiti = next(c for c in alvo if c["apelido"] == conta_rx)
+            with st.spinner(f"Carregando hosts de '{conta_rx}'..."):
+                rows_ubi, erros_ubi = coletar_todos_hosts_ubiquiti([conta_ubiquiti])
+                rows_rx.extend(rows_ubi)
+                erros_rx.extend(f"Ubiquiti {erro}" for erro in erros_ubi)
+
+        if rx_omada:
+            try:
+                rx_omada.seek(0)
+                rows_omada = processar_export_omada_completo(pd.read_excel(rx_omada))
+                if not rows_omada:
+                    erros_rx.append(
+                        "Omada: nenhuma linha válida encontrada; confira as colunas NAME e STATUS."
+                    )
+                rows_rx.extend(rows_omada)
+            except Exception as e:
+                erros_rx.append(f"Omada: {e}")
+
+        if rx_zyxel:
+            try:
+                rx_zyxel.seek(0)
+                rows_zyxel = processar_export_zyxel_completo(pd.read_csv(rx_zyxel))
+                if not rows_zyxel:
+                    erros_rx.append(
+                        "Zyxel: nenhuma linha válida encontrada; confira as colunas Nome/Name e Estado/Status."
+                    )
+                rows_rx.extend(rows_zyxel)
+            except Exception as e:
+                erros_rx.append(f"Zyxel: {e}")
+
+        for erro in erros_rx:
+            st.error(erro)
+
+        rx_columns = [
+            "INEP",
+            "Nome no Console",
+            "Status Rede",
+            "Plataforma",
+            LAST_SEEN_COLUMN,
+            "Uptime WAN",
+            "ISP",
+            "Conta",
+            "IP Externo",
+            "Devices (tot/off)",
+        ]
+        df_rx = pd.DataFrame(rows_rx).reindex(columns=rx_columns)
+        if filtro.strip() and not df_rx.empty:
+            termo = filtro.strip()
+            corresponde = (
+                df_rx["Nome no Console"].astype(str).str.contains(
+                    termo, case=False, na=False, regex=False
+                )
+                | df_rx["INEP"].astype(str).str.contains(
+                    termo, case=False, na=False, regex=False
+                )
+            )
+            df_rx = df_rx[corresponde]
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total", len(df_rx))
+        m2.metric(
+            "Online",
+            df_rx["Status Rede"].str.contains("ONLINE", na=False).sum(),
+        )
+        m3.metric(
+            "Offline",
+            df_rx["Status Rede"].str.contains("OFFLINE", na=False).sum(),
+        )
+
+        if df_rx.empty:
+            st.info("Nenhum dado encontrado para as fontes e o filtro informados.")
+        else:
+            st.dataframe(
+                df_rx.style.map(cor_status, subset=["Status Rede"]),
+                use_container_width=True,
+                height=440,
+            )
+            origem_arquivo = conta_rx if conta_rx != "Nenhum" else "omada_zyxel"
+            st.download_button(
+                "⬇️ Exportar",
+                to_xlsx(df_rx),
+                f"dados_contas_{origem_arquivo}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
 # ─────────────────────────────────────────
 # ABA 5 — MONITORAMENTO
