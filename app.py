@@ -29,6 +29,20 @@ CONFIG_PROVEDORES = "config_provedores.json"
 BASE_URL          = "https://api.ui.com/v1"
 APP_TZ            = ZoneInfo("America/Sao_Paulo")
 LAST_SEEN_COLUMN  = "Último Sinal"
+MONTHS_EN         = {
+    "JAN": 1,
+    "FEB": 2,
+    "MAR": 3,
+    "APR": 4,
+    "MAY": 5,
+    "JUN": 6,
+    "JUL": 7,
+    "AUG": 8,
+    "SEP": 9,
+    "OCT": 10,
+    "NOV": 11,
+    "DEC": 12,
+}
 HUB_REGISTRATION_EMAIL = "breno.brocanello@gmail.com"
 HUB_ACCESS_REQUESTS_FILE = os.path.join("data", "solicitacoes_acesso.json")
 HUB_PASSWORD_HASH_ITERATIONS = 260_000
@@ -1275,6 +1289,41 @@ def extrair_inep_do_nome(nome: str):
     matches = re.findall(r'\b(\d{8})\b', str(nome))
     return matches[-1] if matches else None
 
+def extrair_ultimo_sinal_omada(status: str) -> str:
+    match = re.search(
+        r"Last Uptime:\s*([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{4})\s+"
+        r"(\d{1,2}):(\d{2}):(\d{2})\s+(AM|PM)",
+        str(status),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return "—"
+
+    mes = MONTHS_EN.get(match.group(1).upper())
+    if not mes:
+        return "—"
+
+    hora = int(match.group(4))
+    marcador = match.group(7).upper()
+    if marcador == "PM" and hora != 12:
+        hora += 12
+    elif marcador == "AM" and hora == 12:
+        hora = 0
+
+    try:
+        dt = datetime(
+            int(match.group(3)),
+            mes,
+            int(match.group(2)),
+            hora,
+            int(match.group(5)),
+            int(match.group(6)),
+            tzinfo=APP_TZ,
+        )
+    except ValueError:
+        return "—"
+    return dt.strftime("%d/%m/%Y %H:%M")
+
 def processar_export_omada(df_omada: pd.DataFrame) -> dict:
     resultado = {}
     df_omada.columns = [str(c).strip().upper() for c in df_omada.columns]
@@ -1287,6 +1336,7 @@ def processar_export_omada(df_omada: pd.DataFrame) -> dict:
         if not inep:
             continue
         status_raw = "ONLINE" if status == "ONLINE" else "OFFLINE"
+        ultimo_sinal = extrair_ultimo_sinal_omada(status) if status_raw == "OFFLINE" else "—"
         ip_externo = "—"
         if "IP ADDRESS" in df_omada.columns:
             ips = str(row.get("IP ADDRESS", "")).split(",")
@@ -1294,7 +1344,7 @@ def processar_export_omada(df_omada: pd.DataFrame) -> dict:
         resultado[inep] = {
             "Status Rede":     f"OMADA - {status_raw}",
             "Plataforma":      "OMADA",
-            LAST_SEEN_COLUMN:   "—",
+            LAST_SEEN_COLUMN:   ultimo_sinal,
             "Uptime WAN":      "—",
             "ISP":             "—",
             "Conta":           "Omada Cloud",
@@ -1314,6 +1364,7 @@ def processar_export_omada_completo(df_omada: pd.DataFrame) -> list:
         status = str(row.get("STATUS", "")).strip().upper()
         inep   = extrair_inep_do_nome(nome)
         status_raw = "ONLINE" if status == "ONLINE" else "OFFLINE"
+        ultimo_sinal = extrair_ultimo_sinal_omada(status) if status_raw == "OFFLINE" else "—"
         ip_externo = "—"
         if "IP ADDRESS" in df_omada.columns:
             ips = str(row.get("IP ADDRESS", "")).split(",")
@@ -1323,7 +1374,7 @@ def processar_export_omada_completo(df_omada: pd.DataFrame) -> list:
             "Nome no Console": nome,
             "Status Rede":     f"OMADA - {status_raw}",
             "Plataforma":      "OMADA",
-            LAST_SEEN_COLUMN:   "—",
+            LAST_SEEN_COLUMN:   ultimo_sinal,
             "Uptime WAN":      "—",
             "ISP":             "—",
             "Conta":           "Omada Cloud",
