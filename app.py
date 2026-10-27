@@ -10,6 +10,7 @@ import re
 import secrets as token_secrets
 import smtplib
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
@@ -29,6 +30,7 @@ CONFIG_PROVEDORES = "config_provedores.json"
 BASE_URL          = "https://api.ui.com/v1"
 APP_TZ            = ZoneInfo("America/Sao_Paulo")
 LAST_SEEN_COLUMN  = "Último Sinal"
+ACTIVE_COLUMN     = "Escola Ativa"
 MONTHS_EN         = {
     "JAN": 1,
     "FEB": 2,
@@ -1215,6 +1217,7 @@ def buscar_ineps_ubiquiti(api_key: str, apelido: str, ineps: set) -> dict:
                     "Status Rede":     f"UBIQUITI - {status_raw}",
                     "Plataforma":      "UBIQUITI",
                     LAST_SEEN_COLUMN:   d["ultimo_sinal"],
+                    ACTIVE_COLUMN:      "—",
                     "Uptime WAN":      d["uptime"],
                     "ISP":             d["isp"],
                     "Conta":           apelido,
@@ -1243,6 +1246,7 @@ def coletar_todos_hosts_ubiquiti(contas: list) -> tuple:
                     "Status Rede":     f"UBIQUITI - {status}",
                     "Plataforma":      "UBIQUITI",
                     LAST_SEEN_COLUMN:   d["ultimo_sinal"],
+                    ACTIVE_COLUMN:      "—",
                     "Uptime WAN":      d["uptime"],
                     "ISP":             d["isp"],
                     "Conta":           c["apelido"],
@@ -1289,6 +1293,111 @@ def extrair_inep_do_nome(nome: str):
     matches = re.findall(r'\b(\d{8})\b', str(nome))
     return matches[-1] if matches else None
 
+# ---------------------------------------------------------------
+# Escola ativa / inativa (vem no proprio export Omada ou Zyxel)
+# ---------------------------------------------------------------
+ATIVA_COL_SINONIMOS = (
+    "ATIVO", "ATIVA", "ESCOLA ATIVA", "SITE ATIVO", "ATIVIDADE",
+    "ATIVACAO", "ATIVACAO DA ESCOLA", "SITUACAO", "SITUACAO DA ESCOLA",
+    "STATUS DA ESCOLA", "STATUS ESCOLA", "STATUS DO SITE", "SITE STATUS",
+    "STATUS DA LICENCA", "LICENSE STATUS", "LICENSE", "LICENCA",
+    "ACTIVE", "IS ACTIVE", "ACTIVATION", "ACTIVATION STATUS",
+    "ENABLED", "OPERATIONAL STATUS", "STATUS OPERACIONAL",
+)
+
+ATIVA_VALORES_SIM = (
+    "ATIVO", "ATIVA", "ATIVADO", "ATIVADA", "ACTIVE", "ACTIVATED",
+    "ENABLED", "HABILITADO", "HABILITADA", "EM OPERACAO", "OPERACIONAL",
+    "LICENSED", "LICENCIADO", "SIM", "YES", "TRUE", "1",
+)
+
+ATIVA_VALORES_NAO = (
+    "INATIVO", "INATIVA", "DESATIVADO", "DESATIVADA", "INACTIVE",
+    "DEACTIVATED", "DISABLED", "DESABILITADO", "DESABILITADA",
+    "SUSPENSO", "SUSPENSA", "SUSPENDED", "CANCELADO", "CANCELADA",
+    "CANCELLED", "EXPIRADO", "EXPIRADA", "EXPIRED", "ENCERRADO",
+    "ENCERRADA", "NAO", "NO", "FALSE", "0",
+)
+
+
+def _normalizar_texto(valor) -> str:
+    texto = str(valor).strip().upper()
+    if texto in ("", "NAN", "NONE", "NAT", "—"):
+        return ""
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", texto) if not unicodedata.combining(c)
+    )
+
+
+def normalizar_atividade(valor) -> str:
+    """Converte o valor bruto do export em 'Ativa' / 'Inativa' / '—'."""
+    texto = _normalizar_texto(valor)
+    if not texto:
+        return "—"
+    for termo in ATIVA_VALORES_NAO:
+        if termo == texto or (len(termo) > 3 and termo in texto):
+            return "Inativa"
+    for termo in ATIVA_VALORES_SIM:
+        if termo == texto or (len(termo) > 3 and termo in texto):
+            return "Ativa"
+    return "—"
+
+
+def _coluna_atividade_valida(df: pd.DataFrame, col, exigir_inativa=False) -> bool:
+    """
+    So aceita a coluna se o conteudo realmente parecer ativo/inativo:
+    poucos valores distintos e todos reconheciveis. Evita confundir com
+    colunas numericas ("Active Clients") ou de data ("Activation Time").
+    """
+    try:
+        valores = df[col].dropna().astype(str).str.strip()
+    except Exception:
+        return False
+    unicos = {v for v in valores.unique() if _normalizar_texto(v)}
+    if not unicos or len(unicos) > 8:
+        return False
+    reconhecidos = [normalizar_atividade(v) for v in unicos]
+    if any(r == "—" for r in reconhecidos):
+        return False
+    if exigir_inativa and "Inativa" not in reconhecidos:
+        return False
+    return True
+
+
+def detectar_coluna_atividade(df: pd.DataFrame, ignorar=()) -> str | None:
+    """
+    Descobre qual coluna do export informa se a escola esta ativa.
+    1) nome exato do cabecalho (sinonimos);
+    2) nome parecido (ATIV/ACTIV/SITUAC/LICEN/ENABLED);
+    3) conteudo (coluna de baixa cardinalidade com valores ativo/inativo).
+    Em todos os casos o conteudo precisa ser reconhecivel.
+    """
+    ignorados = {_normalizar_texto(c) for c in ignorar}
+    colunas   = [(c, _normalizar_texto(c)) for c in df.columns]
+    livres    = [(c, cu) for c, cu in colunas if cu and cu not in ignorados]
+
+    for col, cu in livres:
+        if cu in ATIVA_COL_SINONIMOS and _coluna_atividade_valida(df, col):
+            return col
+    for col, cu in livres:
+        parecido = any(s in cu for s in ("ATIV", "ACTIV", "SITUAC", "LICEN", "ENABLED"))
+        if parecido and _coluna_atividade_valida(df, col):
+            return col
+    for col, _cu in livres:
+        if _coluna_atividade_valida(df, col, exigir_inativa=True):
+            return col
+    return None
+
+
+def extrair_atividade(row, col_ativa) -> str:
+    if not col_ativa:
+        return "—"
+    try:
+        return normalizar_atividade(row.get(col_ativa, ""))
+    except Exception:
+        return "—"
+
+
 def extrair_ultimo_sinal_omada(status: str) -> str:
     match = re.search(
         r"Last Uptime:\s*([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{4})\s+"
@@ -1329,6 +1438,7 @@ def processar_export_omada(df_omada: pd.DataFrame) -> dict:
     df_omada.columns = [str(c).strip().upper() for c in df_omada.columns]
     if "NAME" not in df_omada.columns or "STATUS" not in df_omada.columns:
         return resultado
+    col_ativa = detectar_coluna_atividade(df_omada, ignorar=("NAME", "STATUS"))
     for _, row in df_omada.iterrows():
         nome   = str(row.get("NAME", "")).strip()
         status = str(row.get("STATUS", "")).strip().upper()
@@ -1345,6 +1455,7 @@ def processar_export_omada(df_omada: pd.DataFrame) -> dict:
             "Status Rede":     f"OMADA - {status_raw}",
             "Plataforma":      "OMADA",
             LAST_SEEN_COLUMN:   ultimo_sinal,
+            ACTIVE_COLUMN:      extrair_atividade(row, col_ativa),
             "Uptime WAN":      "—",
             "ISP":             "—",
             "Conta":           "Omada Cloud",
@@ -1359,6 +1470,7 @@ def processar_export_omada_completo(df_omada: pd.DataFrame) -> list:
     df_omada.columns = [str(c).strip().upper() for c in df_omada.columns]
     if "NAME" not in df_omada.columns or "STATUS" not in df_omada.columns:
         return rows
+    col_ativa = detectar_coluna_atividade(df_omada, ignorar=("NAME", "STATUS"))
     for _, row in df_omada.iterrows():
         nome   = str(row.get("NAME", "")).strip()
         status = str(row.get("STATUS", "")).strip().upper()
@@ -1375,6 +1487,7 @@ def processar_export_omada_completo(df_omada: pd.DataFrame) -> list:
             "Status Rede":     f"OMADA - {status_raw}",
             "Plataforma":      "OMADA",
             LAST_SEEN_COLUMN:   ultimo_sinal,
+            ACTIVE_COLUMN:      extrair_atividade(row, col_ativa),
             "Uptime WAN":      "—",
             "ISP":             "—",
             "Conta":           "Omada Cloud",
@@ -1405,6 +1518,7 @@ def processar_export_zyxel(df_zyxel: pd.DataFrame) -> dict:
         elif cu in ("% OFFLINE", "% OFFLINE DEVICES"):col_map["pct_offline"] = col
     if "status" not in col_map or "nome" not in col_map:
         return resultado
+    col_ativa = detectar_coluna_atividade(df_zyxel, ignorar=col_map.values())
     for _, row in df_zyxel.iterrows():
         nome           = str(row[col_map["nome"]]).strip()
         status_raw     = str(row[col_map["status"]]).strip().upper()
@@ -1418,6 +1532,7 @@ def processar_export_zyxel(df_zyxel: pd.DataFrame) -> dict:
             "Status Rede":       f"ZYXEL - {status_interno}",
             "Plataforma":        "ZYXEL",
             LAST_SEEN_COLUMN:     "—",
+            ACTIVE_COLUMN:        extrair_atividade(row, col_ativa),
             "Uptime WAN":        f"{pct_offline} offline" if pct_offline != "—" else "—",
             "ISP":               "—",
             "Conta":             "Zyxel Nebula",
@@ -1440,6 +1555,7 @@ def processar_export_zyxel_completo(df_zyxel: pd.DataFrame) -> list:
         elif cu in ("% OFFLINE", "% OFFLINE DEVICES"): col_map["pct_offline"] = col
     if "status" not in col_map or "nome" not in col_map:
         return rows
+    col_ativa = detectar_coluna_atividade(df_zyxel, ignorar=col_map.values())
     for _, row in df_zyxel.iterrows():
         nome           = str(row[col_map["nome"]]).strip()
         status_raw     = str(row[col_map["status"]]).strip().upper()
@@ -1454,6 +1570,7 @@ def processar_export_zyxel_completo(df_zyxel: pd.DataFrame) -> list:
             "Status Rede":       f"ZYXEL - {status_interno}",
             "Plataforma":        "ZYXEL",
             LAST_SEEN_COLUMN:     "—",
+            ACTIVE_COLUMN:        extrair_atividade(row, col_ativa),
             "Uptime WAN":        f"{pct_offline} offline" if pct_offline != "—" else "—",
             "ISP":               "—",
             "Conta":             "Zyxel Nebula",
@@ -1569,9 +1686,14 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
     df["FASE"] = df["Conta"].apply(lambda c: "4.2" if c in _f42 else "") \
         if "Conta" in df.columns else ""
 
-    col_base = [c for c in ["INEP", "Nome no Console", "Status", "Conta", "FASE"]
+    for _c in (LAST_SEEN_COLUMN, ACTIVE_COLUMN):
+        if _c in df.columns:
+            df[_c] = df[_c].fillna("—").replace("", "—")
+
+    col_base = [c for c in ["INEP", "Nome no Console", "Status", LAST_SEEN_COLUMN,
+                            ACTIVE_COLUMN, "Conta", "FASE"]
                 if c in df.columns]
-    df = df[col_base].fillna("").copy()
+    df = df[col_base].fillna("—").copy()
 
     # Referência
     ineps_ref: set = set()
@@ -1652,6 +1774,12 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
          GRN_BG if (total and online/total >= .5) else RED_BG, "000000"),
         ("Não encontradas em nenhum dashboard",   len(nao_enc), ORG_BG, ORG_FG),
     ]
+    if ACTIVE_COLUMN in validos.columns:
+        n_inativas = int((validos[ACTIVE_COLUMN] == "Inativa").sum())
+        n_ativas   = int((validos[ACTIVE_COLUMN] == "Ativa").sum())
+        if n_inativas or n_ativas:
+            kpis.append(("Escolas ativas (Omada/Zyxel)",   n_ativas,   GRN_BG, GRN_FG))
+            kpis.append(("Escolas inativas (Omada/Zyxel)", n_inativas, ORG_BG, ORG_FG))
     for i, (label, val, bg, fg) in enumerate(kpis):
         r = 6 + i
         _cell(ws, r, 1, label, bg=bg, fg=fg, size=11)
@@ -1659,19 +1787,22 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
         _merge_row(ws, r, 2, NC)
         ws.row_dimensions[r].height = 24
 
-    ws.row_dimensions[11].height = 12  # espaçador
+    r_espaco  = 6 + len(kpis)
+    ws.row_dimensions[r_espaco].height = 12  # espaçador
 
-    # Linha 12 — cabeçalho UF
-    _title(ws, 12, NC, "RESUMO POR ESTADO (UF)", bg=NAVY, size=12, height=28)
+    # Cabeçalho da seção UF
+    r_uf_tit = r_espaco + 1
+    _title(ws, r_uf_tit, NC, "RESUMO POR ESTADO (UF)", bg=NAVY, size=12, height=28)
 
-    # Linha 13 — colunas UF
+    # Colunas UF
+    r_uf_hdr = r_uf_tit + 1
     for ci, h in enumerate(["UF", "Total", "Online", "Offline", "% Online"], 1):
-        _hdr(ws, 13, ci, h, bg=BLUE)
-    ws.row_dimensions[13].height = 22
+        _hdr(ws, r_uf_hdr, ci, h, bg=BLUE)
+    ws.row_dimensions[r_uf_hdr].height = 22
 
-    # Linhas 14+ — dados UF
+    # Dados UF
     for i, (_, r) in enumerate(por_uf.iterrows()):
-        ri = 14 + i
+        ri = r_uf_hdr + 1 + i
         pct = f"{r['Online']/r['Total']*100:.1f}%" if r["Total"] else "—"
         bg_row = GRAY if i % 2 == 0 else WHITE
         for ci, v in enumerate([r["UF"], int(r["Total"]), int(r["Online"]),
@@ -1703,7 +1834,8 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
             return
 
         # Linha 2 — cabeçalhos
-        CENTRAR = {"INEP", "Status", "Conta", "FASE", "Ordem"}
+        CENTRAR = {"INEP", "Status", LAST_SEEN_COLUMN, ACTIVE_COLUMN,
+                   "Conta", "FASE", "Ordem"}
         for ci, col_name in enumerate(cols, 1):
             _hdr(ws2, 2, ci, col_name, bg=NAVY)
         ws2.row_dimensions[2].height = 26
@@ -1766,6 +1898,7 @@ def deduplicar_por_inep(todos: dict) -> dict:
     def _score(dados):
         s = 0
         if "ONLINE" in str(dados.get("Status Rede", "")): s += 100
+        if str(dados.get(LAST_SEEN_COLUMN, "—")) not in ("—", "", "nan"): s += 20
         if str(dados.get("ISP",        "—")) not in ("—", "", "nan"): s += 10
         if str(dados.get("IP Externo", "—")) not in ("—", "", "nan"): s += 5
         if str(dados.get("Uptime WAN", "—")) not in ("—", "", "nan"): s += 1
@@ -1804,6 +1937,7 @@ def deduplicar_df_por_inep(df: pd.DataFrame) -> tuple:
     def _score_row(row):
         s = 0
         if "ONLINE" in str(row.get("Status Rede", "")): s += 100
+        if str(row.get(LAST_SEEN_COLUMN, "—")) not in ("—", "", "nan"): s += 20
         if str(row.get("ISP",        "—")) not in ("—", "", "nan"): s += 10
         if str(row.get("IP Externo", "—")) not in ("—", "", "nan"): s += 5
         if str(row.get("Uptime WAN", "—")) not in ("—", "", "nan"): s += 1
@@ -1949,6 +2083,13 @@ with t2:
             df_inv_om_prev = pd.read_excel(inv_omada)
             inv_omada.seek(0)
             st.caption(f"{len(df_inv_om_prev)} controllers carregados")
+            _col_at_om = detectar_coluna_atividade(
+                df_inv_om_prev, ignorar=("NAME", "STATUS")
+            )
+            st.caption(
+                f"✓ Escola ativa/inativa: coluna **{_col_at_om}**" if _col_at_om
+                else "⚠️ Nenhuma coluna de ativa/inativa identificada neste export"
+            )
     with col_inv_zy:
         st.caption("🟣 **Zyxel** — export CSV do Nebula (Overview → Sites)")
         inv_zyxel = st.file_uploader("Export Zyxel (.csv)", type=["csv"], key="inv_zyxel")
@@ -1956,6 +2097,17 @@ with t2:
             df_inv_zy_prev = pd.read_csv(inv_zyxel)
             inv_zyxel.seek(0)
             st.caption(f"{len(df_inv_zy_prev)} sites carregados")
+            _col_at_zy = detectar_coluna_atividade(
+                df_inv_zy_prev,
+                ignorar=("NOME", "NAME", "ESTADO", "STATUS",
+                         "DISPOSITIVOS", "DEVICES",
+                         "DISPOSITIVOS OFFLINE", "OFFLINE DEVICES",
+                         "% OFFLINE", "% OFFLINE DEVICES"),
+            )
+            st.caption(
+                f"✓ Escola ativa/inativa: coluna **{_col_at_zy}**" if _col_at_zy
+                else "⚠️ Nenhuma coluna de ativa/inativa identificada neste export"
+            )
 
     st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
 
@@ -2035,7 +2187,10 @@ with t2:
 
                     # Garante ordem das colunas
                     col_order = ["INEP","Nome no Console","Status Rede","Status Agregado","Plataforma",
-                                 LAST_SEEN_COLUMN,"Uptime WAN","ISP","Conta","IP Externo"]
+                                 LAST_SEEN_COLUMN,ACTIVE_COLUMN,"Uptime WAN","ISP","Conta","IP Externo"]
+                    for _c in (LAST_SEEN_COLUMN, ACTIVE_COLUMN):
+                        if _c in df_inv.columns:
+                            df_inv[_c] = df_inv[_c].fillna("—").replace("", "—")
                     df_inv = df_inv[[c for c in col_order if c in df_inv.columns] +
                                     [c for c in df_inv.columns if c not in col_order]]
                     st.session_state.df_inventario     = df_inv
