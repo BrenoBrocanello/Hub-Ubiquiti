@@ -1297,6 +1297,11 @@ def extrair_inep_do_nome(nome: str):
 # Escola ativa / inativa (vem no proprio export Omada ou Zyxel)
 # ---------------------------------------------------------------
 ATIVA_COL_SINONIMOS = (
+    # O dado de suporte/atividade costuma vir na descricao (Omada)
+    # ou nos marcadores do site (Zyxel).
+    "DESCRIPTION", "DESCRICAO", "DESCRICAO DA ESCOLA",
+    "MARCADORES", "MARCADOR", "TAGS", "TAG", "LABELS",
+    "SUPORTE", "STATUS DO SUPORTE", "OBSERVACAO", "OBSERVACOES", "OBS",
     "ATIVO", "ATIVA", "ESCOLA ATIVA", "SITE ATIVO", "ATIVIDADE",
     "ATIVACAO", "ATIVACAO DA ESCOLA", "SITUACAO", "SITUACAO DA ESCOLA",
     "STATUS DA ESCOLA", "STATUS ESCOLA", "STATUS DO SITE", "SITE STATUS",
@@ -1305,24 +1310,31 @@ ATIVA_COL_SINONIMOS = (
     "ENABLED", "OPERATIONAL STATUS", "STATUS OPERACIONAL",
 )
 
+# Termos com mais de 3 caracteres sao procurados dentro do texto;
+# os demais so valem como valor exato da celula.
 ATIVA_VALORES_SIM = (
-    "ATIVO", "ATIVA", "ATIVADO", "ATIVADA", "ACTIVE", "ACTIVATED",
-    "ENABLED", "HABILITADO", "HABILITADA", "EM OPERACAO", "OPERACIONAL",
-    "LICENSED", "LICENCIADO", "SIM", "YES", "TRUE", "1",
+    "SUPORTE ATIVO", "COM SUPORTE", "ATIVO", "ATIVA", "ATIVADO", "ATIVADA",
+    "ACTIVE", "ACTIVATED", "ENABLED", "HABILITADO", "HABILITADA",
+    "EM OPERACAO", "OPERACIONAL", "LICENSED", "LICENCIADO",
 )
 
 ATIVA_VALORES_NAO = (
-    "INATIVO", "INATIVA", "DESATIVADO", "DESATIVADA", "INACTIVE",
-    "DEACTIVATED", "DISABLED", "DESABILITADO", "DESABILITADA",
-    "SUSPENSO", "SUSPENSA", "SUSPENDED", "CANCELADO", "CANCELADA",
-    "CANCELLED", "EXPIRADO", "EXPIRADA", "EXPIRED", "ENCERRADO",
-    "ENCERRADA", "NAO", "NO", "FALSE", "0",
+    "SUPORTE NAO", "SEM SUPORTE", "NAO POSSUI SUPORTE",
+    "DESATIVAD", "INATIVO", "INATIVA", "INACTIVE", "DEACTIVATED",
+    "DISABLED", "DESABILITAD", "SUSPENSO", "SUSPENSA", "SUSPENDED",
+    "CANCELAD", "CANCELLED", "EXPIRAD", "EXPIRED", "ENCERRAD",
 )
+
+# So valem em colunas realmente binarias (ate 3 valores distintos).
+ATIVA_BOOLEANOS_SIM = ("SIM", "YES", "TRUE", "1")
+ATIVA_BOOLEANOS_NAO = ("NAO", "NO", "FALSE", "0")
+ATIVA_BOOLEANOS     = ATIVA_BOOLEANOS_SIM + ATIVA_BOOLEANOS_NAO
 
 
 def _normalizar_texto(valor) -> str:
-    texto = str(valor).strip().upper()
-    if texto in ("", "NAN", "NONE", "NAT", "—"):
+    texto = str(valor).replace("_", " ").strip().upper()
+    texto = re.sub(r"\s+", " ", texto)
+    if texto in ("", "-", "--", "NAN", "NONE", "NAT", "—"):
         return ""
     return "".join(
         c for c in unicodedata.normalize("NFKD", texto) if not unicodedata.combining(c)
@@ -1334,6 +1346,10 @@ def normalizar_atividade(valor) -> str:
     texto = _normalizar_texto(valor)
     if not texto:
         return "—"
+    if texto in ATIVA_BOOLEANOS_NAO:
+        return "Inativa"
+    if texto in ATIVA_BOOLEANOS_SIM:
+        return "Ativa"
     for termo in ATIVA_VALORES_NAO:
         if termo == texto or (len(termo) > 3 and termo in texto):
             return "Inativa"
@@ -1343,50 +1359,66 @@ def normalizar_atividade(valor) -> str:
     return "—"
 
 
-def _coluna_atividade_valida(df: pd.DataFrame, col, exigir_inativa=False) -> bool:
+def _avaliar_coluna_atividade(df: pd.DataFrame, col, exigir_inativa=False) -> float:
     """
-    So aceita a coluna se o conteudo realmente parecer ativo/inativo:
-    poucos valores distintos e todos reconheciveis. Evita confundir com
-    colunas numericas ("Active Clients") ou de data ("Activation Time").
+    Mede o quanto a coluna parece informar atividade: devolve a fracao de
+    linhas preenchidas que da para classificar. Valores numericos soltos so
+    contam em colunas binarias, para nao confundir com "Dispositivos" ou
+    "Active Clients".
     """
     try:
-        valores = df[col].dropna().astype(str).str.strip()
+        textos = [_normalizar_texto(v) for v in df[col].dropna().astype(str)]
     except Exception:
-        return False
-    unicos = {v for v in valores.unique() if _normalizar_texto(v)}
-    if not unicos or len(unicos) > 8:
-        return False
-    reconhecidos = [normalizar_atividade(v) for v in unicos]
-    if any(r == "—" for r in reconhecidos):
-        return False
-    if exigir_inativa and "Inativa" not in reconhecidos:
-        return False
-    return True
+        return 0.0
+    textos = [t for t in textos if t]
+    if not textos:
+        return 0.0
+    distintos = set(textos)
+    if len(distintos) > 40:          # texto livre demais para ser um status
+        return 0.0
+    binaria = len(distintos) <= 3
+
+    classificados, tem_inativa = 0, False
+    for t in textos:
+        if not binaria and t in ATIVA_BOOLEANOS:
+            continue                 # numero solto numa coluna nao binaria
+        r = normalizar_atividade(t)
+        if r == "—":
+            continue
+        classificados += 1
+        if r == "Inativa":
+            tem_inativa = True
+    if exigir_inativa and not tem_inativa:
+        return 0.0
+    return classificados / len(textos)
 
 
 def detectar_coluna_atividade(df: pd.DataFrame, ignorar=()) -> str | None:
     """
     Descobre qual coluna do export informa se a escola esta ativa.
     1) nome exato do cabecalho (sinonimos);
-    2) nome parecido (ATIV/ACTIV/SITUAC/LICEN/ENABLED);
-    3) conteudo (coluna de baixa cardinalidade com valores ativo/inativo).
-    Em todos os casos o conteudo precisa ser reconhecivel.
+    2) nome parecido (ATIV/ACTIV/SITUAC/LICEN/ENABLED/SUPORTE);
+    3) conteudo, quando alguma coluna claramente fala de ativo/inativo.
+    Em todos os casos o conteudo precisa ser majoritariamente reconhecivel.
     """
     ignorados = {_normalizar_texto(c) for c in ignorar}
-    colunas   = [(c, _normalizar_texto(c)) for c in df.columns]
-    livres    = [(c, cu) for c, cu in colunas if cu and cu not in ignorados]
+    livres = [(c, _normalizar_texto(c)) for c in df.columns]
+    livres = [(c, cu) for c, cu in livres if cu and cu not in ignorados]
 
     for col, cu in livres:
-        if cu in ATIVA_COL_SINONIMOS and _coluna_atividade_valida(df, col):
+        if cu in ATIVA_COL_SINONIMOS and _avaliar_coluna_atividade(df, col) >= 0.5:
             return col
     for col, cu in livres:
-        parecido = any(s in cu for s in ("ATIV", "ACTIV", "SITUAC", "LICEN", "ENABLED"))
-        if parecido and _coluna_atividade_valida(df, col):
+        parecido = any(s in cu for s in ("ATIV", "ACTIV", "SITUAC", "LICEN",
+                                         "ENABLED", "SUPORTE", "MARCADOR", "TAG"))
+        if parecido and _avaliar_coluna_atividade(df, col) >= 0.5:
             return col
+    melhor, melhor_taxa = None, 0.0
     for col, _cu in livres:
-        if _coluna_atividade_valida(df, col, exigir_inativa=True):
-            return col
-    return None
+        taxa = _avaliar_coluna_atividade(df, col, exigir_inativa=True)
+        if taxa > melhor_taxa:
+            melhor, melhor_taxa = col, taxa
+    return melhor if melhor_taxa >= 0.6 else None
 
 
 def extrair_atividade(row, col_ativa) -> str:
@@ -1633,20 +1665,41 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
     GRAY    = "F2F2F2"
     BD      = "BFBFBF"
 
-    def _side():   return Side(style="thin", color=BD)
-    def _border(): return Border(left=_side(), right=_side(), top=_side(), bottom=_side())
+    # Estilos reaproveitados: criar um objeto por celula deixa a geracao
+    # dezenas de vezes mais lenta em planilhas com milhares de linhas.
+    _SIDE   = Side(style="thin", color=BD)
+    _BORDER = Border(left=_SIDE, right=_SIDE, top=_SIDE, bottom=_SIDE)
+    _fontes, _alinhamentos, _fundos = {}, {}, {}
+
+    def _fonte(size, fg, bold, italic):
+        chave = (size, fg, bold, italic)
+        if chave not in _fontes:
+            _fontes[chave] = Font(name="Calibri", size=size, color=fg,
+                                  bold=bold, italic=italic)
+        return _fontes[chave]
+
+    def _alinhamento(align):
+        if align not in _alinhamentos:
+            _alinhamentos[align] = Alignment(horizontal=align, vertical="center",
+                                             wrap_text=False)
+        return _alinhamentos[align]
+
+    def _fundo(bg):
+        if bg not in _fundos:
+            _fundos[bg] = PatternFill("solid", fgColor=bg)
+        return _fundos[bg]
 
     def _cell(ws, row, col, value=None, bg=None, fg="000000", bold=False,
               size=10, align="left", italic=False, border=True):
         c = ws.cell(row=row, column=col)
         if value is not None:
             c.value = value
-        c.font = Font(name="Calibri", size=size, color=fg, bold=bold, italic=italic)
-        c.alignment = Alignment(horizontal=align, vertical="center", wrap_text=False)
+        c.font = _fonte(size, fg, bold, italic)
+        c.alignment = _alinhamento(align)
         if bg:
-            c.fill = PatternFill("solid", fgColor=bg)
+            c.fill = _fundo(bg)
         if border:
-            c.border = _border()
+            c.border = _BORDER
         return c
 
     def _hdr(ws, row, col, value, bg=NAVY):
@@ -2281,10 +2334,19 @@ with t2:
         )
         st.caption(f"{len(df_inv_f):,} de {len(df_inv):,} escolas exibidas")
 
+        # A planilha formatada leva alguns segundos; sem o spinner a área dos
+        # botões fica vazia enquanto o arquivo é montado.
+        try:
+            with st.spinner("Preparando a planilha formatada…"):
+                xlsx_inv = gerar_excel_inventario_formatado(df_inv)
+            erro_xlsx = None
+        except Exception as e:
+            xlsx_inv, erro_xlsx = to_xlsx(df_inv), e
+
         ce1, ce2, _ = st.columns([1, 1, 3])
         ce1.download_button(
             "⬇️ Exportar inventário completo",
-            gerar_excel_inventario_formatado(df_inv),
+            xlsx_inv,
             f"inventario_{datetime.now().strftime('%Y-%m-%d')}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             help="Planilha formatada: ESTATISTICAS, Geral, Escolas não encontradas, por conta."
@@ -2296,6 +2358,11 @@ with t2:
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             help="Exporta somente o que está visível na tabela (com filtros aplicados)."
         )
+        if erro_xlsx:
+            st.error(
+                f"Não foi possível montar a planilha formatada ({erro_xlsx}). "
+                "O botão acima está entregando uma versão simples, em aba única."
+            )
     else:
         st.info("Clique em **Coletar Inventário Completo** para carregar todas as escolas.")
 
