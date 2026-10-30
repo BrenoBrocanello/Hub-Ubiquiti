@@ -31,6 +31,14 @@ BASE_URL          = "https://api.ui.com/v1"
 APP_TZ            = ZoneInfo("America/Sao_Paulo")
 LAST_SEEN_COLUMN  = "Último Sinal"
 ACTIVE_COLUMN     = "Escola Ativa"
+# Colunas alimentadas pelo export de controle de OS do portal EACE.
+EACE_TICKET_COLUMN = "Chamado Ativo"
+EACE_OS_COLUMN     = "Nº OS"
+EACE_STATUS_COLUMN = "Status Chamado"
+EACE_DAYS_COLUMN   = "Dias em Aberto"
+EACE_OPENED_COLUMN = "Chamado Aberto em"
+EACE_COLUMNS       = [EACE_TICKET_COLUMN, EACE_OS_COLUMN, EACE_STATUS_COLUMN,
+                      EACE_DAYS_COLUMN, EACE_OPENED_COLUMN]
 MONTHS_EN         = {
     "JAN": 1,
     "FEB": 2,
@@ -1612,6 +1620,155 @@ def processar_export_zyxel_completo(df_zyxel: pd.DataFrame) -> list:
     return rows
 
 # ═══════════════════════════════════════════════════════════════
+# EACE — EXPORT DE CONTROLE DE OS
+# ═══════════════════════════════════════════════════════════════
+# Status que o portal usa para chamado encerrado. Qualquer outro
+# ("Paralisados", "Rede Externa", "Em análise"...) conta como ativo.
+EACE_STATUS_ENCERRADOS = {
+    "CONCLUIDO", "CONCLUIDA", "CANCELADO", "CANCELADA",
+    "ENCERRADO", "ENCERRADA", "FINALIZADO", "FINALIZADA",
+    "FECHADO", "FECHADA", "RESOLVIDO", "RESOLVIDA",
+}
+
+EACE_ALIASES = {
+    "inep":      ("INEP", "CODIGO INEP", "COD INEP"),
+    "ticket":    ("TICKET#", "TICKET", "NUMERO DA OS", "NUMERO OS", "N OS", "OS", "CHAMADO"),
+    "status":    ("STATUS DO CHAMADO", "STATUS", "SITUACAO"),
+    "aberto":    ("ABERTO NO DIA", "ABERTO EM", "DATA DE ABERTURA", "DATA ABERTURA", "ABERTURA"),
+    "dias":      ("NUMERO DE DIAS EM ABERTO", "DIAS EM ABERTO", "DIAS ABERTO", "DIAS"),
+    "escola":    ("ESCOLA", "NOME DA ESCOLA", "UNIDADE"),
+    "atribuido": ("ATRIBUIDO A", "ATRIBUIDO", "RESPONSAVEL", "ANALISTA"),
+}
+
+
+def _eace_coluna(df: pd.DataFrame, chave: str) -> str | None:
+    """Localiza a coluna do export EACE correspondente à chave lógica."""
+    alvos = [_normalizar_texto(a) for a in EACE_ALIASES[chave]]
+    norm  = {_normalizar_texto(c): c for c in df.columns}
+    for alvo in alvos:
+        if alvo in norm:
+            return norm[alvo]
+    for nome_norm, original in norm.items():
+        if any(alvo in nome_norm for alvo in alvos):
+            return original
+    return None
+
+
+def _eace_inep(valor) -> str:
+    """Normaliza o INEP do export (remove '.0' de células numéricas)."""
+    texto = re.sub(r"\.0$", "", str(valor or "").strip())
+    texto = re.sub(r"\D", "", texto)
+    return texto
+
+
+def _eace_dias(abertura, valor_planilha) -> int | None:
+    """
+    Dias em aberto. A coluna da planilha vem zerada/negativa nos chamados
+    paralisados, então a data de abertura tem prioridade.
+    """
+    if abertura is not None and not pd.isnull(abertura):
+        try:
+            dias = (datetime.now(APP_TZ).date() - abertura.date()).days
+            if dias >= 0:
+                return dias
+        except Exception:
+            pass
+    try:
+        dias = int(float(str(valor_planilha).replace(",", ".")))
+        return dias if dias >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def processar_export_eace(df_eace: pd.DataFrame) -> dict:
+    """
+    Lê o export de controle de OS do portal EACE e devolve, por INEP,
+    o resumo dos chamados que continuam em aberto.
+    """
+    col_inep = _eace_coluna(df_eace, "inep")
+    if not col_inep:
+        return {}
+
+    col_ticket = _eace_coluna(df_eace, "ticket")
+    col_status = _eace_coluna(df_eace, "status")
+    col_aberto = _eace_coluna(df_eace, "aberto")
+    col_dias   = _eace_coluna(df_eace, "dias")
+
+    datas = (
+        pd.to_datetime(df_eace[col_aberto], dayfirst=True, errors="coerce")
+        if col_aberto else pd.Series([pd.NaT] * len(df_eace), index=df_eace.index)
+    )
+
+    mapa: dict[str, dict] = {}
+    for idx, row in df_eace.iterrows():
+        inep = _eace_inep(row[col_inep])
+        if not inep:
+            continue
+
+        status = str(row[col_status]).strip() if col_status else ""
+        if _normalizar_texto(status) in EACE_STATUS_ENCERRADOS:
+            continue
+
+        abertura = datas.get(idx)
+        dados    = mapa.setdefault(inep, {"os": [], "status": [], "dias": [],
+                                          "abertura": [], "qtd": 0})
+        dados["qtd"] += 1
+
+        if col_ticket:
+            ticket = re.sub(r"\.0$", "", str(row[col_ticket] or "").strip())
+            if ticket and ticket.upper() not in ("NAN", "NONE"):
+                dados["os"].append(ticket)
+        if status:
+            dados["status"].append(status)
+
+        dias = _eace_dias(abertura, row[col_dias] if col_dias else None)
+        if dias is not None:
+            dados["dias"].append(dias)
+        if abertura is not None and not pd.isnull(abertura):
+            dados["abertura"].append(abertura)
+
+    resumo = {}
+    for inep, d in mapa.items():
+        status_unicos = list(dict.fromkeys(d["status"]))
+        resumo[inep] = {
+            EACE_TICKET_COLUMN: "Sim",
+            EACE_OS_COLUMN:     " / ".join(dict.fromkeys(d["os"])) or "—",
+            EACE_STATUS_COLUMN: " / ".join(status_unicos) or "—",
+            EACE_DAYS_COLUMN:   max(d["dias"]) if d["dias"] else "—",
+            EACE_OPENED_COLUMN: min(d["abertura"]).strftime("%d/%m/%Y") if d["abertura"] else "—",
+            "_qtd":             d["qtd"],
+        }
+    return resumo
+
+
+@st.cache_data(show_spinner=False)
+def carregar_chamados_eace(conteudo: bytes) -> tuple[dict, int]:
+    """
+    Lê o .xlsx do EACE uma única vez por arquivo — o Streamlit reexecuta a
+    página a cada interação e o export passa de 12 mil linhas.
+    """
+    df_eace = pd.read_excel(BytesIO(conteudo), dtype=str)
+    return processar_export_eace(df_eace), len(df_eace)
+
+
+def aplicar_chamados_eace(df: pd.DataFrame, chamados: dict) -> pd.DataFrame:
+    """Acrescenta as colunas de chamado ativo do EACE ao inventário."""
+    if df is None or df.empty:
+        return df
+
+    df = df.copy()
+    ineps = df["INEP"].astype(str).map(_eace_inep) if "INEP" in df.columns \
+        else pd.Series([""] * len(df), index=df.index)
+
+    for coluna in EACE_COLUMNS:
+        padrao = "Não" if coluna == EACE_TICKET_COLUMN else "—"
+        df[coluna] = ineps.map(
+            lambda i: chamados.get(i, {}).get(coluna, padrao) if i else padrao
+        )
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════
 COR_STATUS = {
@@ -1744,7 +1901,7 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
             df[_c] = df[_c].fillna("—").replace("", "—")
 
     col_base = [c for c in ["INEP", "Nome no Console", "Status", LAST_SEEN_COLUMN,
-                            ACTIVE_COLUMN, "Conta", "FASE"]
+                            ACTIVE_COLUMN, *EACE_COLUMNS, "Conta", "FASE"]
                 if c in df.columns]
     df = df[col_base].fillna("—").copy()
 
@@ -1779,6 +1936,17 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
                   .sort_values("Total", ascending=False))
     else:
         por_uf = pd.DataFrame(columns=["UF","Total","Online","Offline"])
+
+    # Escolas com chamado ativo no EACE (só existe quando o export foi enviado)
+    tem_eace = EACE_TICKET_COLUMN in df.columns
+    df_chamados = (
+        validos[validos[EACE_TICKET_COLUMN] == "Sim"].copy()
+        if tem_eace else pd.DataFrame(columns=col_base)
+    )
+    if tem_eace and not df_chamados.empty and EACE_DAYS_COLUMN in df_chamados.columns:
+        df_chamados = df_chamados.assign(
+            _ord=pd.to_numeric(df_chamados[EACE_DAYS_COLUMN], errors="coerce").fillna(-1)
+        ).sort_values("_ord", ascending=False).drop(columns="_ord")
 
     contas_ordem = sorted(df["Conta"].dropna().unique().tolist()) \
         if "Conta" in df.columns else []
@@ -1833,6 +2001,10 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
         if n_inativas or n_ativas:
             kpis.append(("Escolas ativas (Omada/Zyxel)",   n_ativas,   GRN_BG, GRN_FG))
             kpis.append(("Escolas inativas (Omada/Zyxel)", n_inativas, ORG_BG, ORG_FG))
+    if tem_eace:
+        kpis.append(("Escolas com chamado ativo (EACE)", len(df_chamados), RED_BG, RED_FG))
+        kpis.append(("Escolas sem chamado ativo (EACE)",
+                     int(total - len(df_chamados)), GRN_BG, GRN_FG))
     for i, (label, val, bg, fg) in enumerate(kpis):
         r = 6 + i
         _cell(ws, r, 1, label, bg=bg, fg=fg, size=11)
@@ -1888,7 +2060,8 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
 
         # Linha 2 — cabeçalhos
         CENTRAR = {"INEP", "Status", LAST_SEEN_COLUMN, ACTIVE_COLUMN,
-                   "Conta", "FASE", "Ordem"}
+                   "Conta", "FASE", "Ordem", EACE_TICKET_COLUMN, EACE_OS_COLUMN,
+                   EACE_DAYS_COLUMN, EACE_OPENED_COLUMN}
         for ci, col_name in enumerate(cols, 1):
             _hdr(ws2, 2, ci, col_name, bg=NAVY)
         ws2.row_dimensions[2].height = 26
@@ -1927,6 +2100,11 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
     criar_aba("Escolas não encontradas dash´s", df_nao,
               f"ESCOLAS NÃO ENCONTRADAS EM NENHUM DASHBOARD  ({len(nao_enc)} INEPs)",
               bg_titulo=RED_HDR)
+
+    if tem_eace:
+        criar_aba("Chamados Ativos EACE", df_chamados,
+                  f"ESCOLAS COM CHAMADO ATIVO NO EACE  ({len(df_chamados)} escolas)",
+                  bg_titulo=RED_HDR)
 
     for conta in contas_ordem:
         df_c  = df[df["Conta"] == conta].copy()
@@ -2122,13 +2300,14 @@ with t2:
     st.markdown("### 🌐 Inventário Geral de Escolas")
     st.write(
         "Coleta **todas** as escolas de todas as plataformas, independente de chamados abertos. "
-        "Ubiquiti é buscado via API. Omada e Zyxel via upload dos exports."
+        "Ubiquiti é buscado via API. Omada e Zyxel via upload dos exports. "
+        "O export de controle de OS do EACE é opcional e marca quais escolas têm chamado ativo."
     )
 
     st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
 
-    # Uploads Omada e Zyxel para o inventário
-    col_inv_om, col_inv_zy = st.columns(2)
+    # Uploads Omada, Zyxel e EACE para o inventário
+    col_inv_om, col_inv_zy, col_inv_ea = st.columns(3)
     with col_inv_om:
         st.caption("🔵 **Omada** — export do portal On Premise Systems")
         inv_omada = st.file_uploader("Export Omada (.xlsx)", type=["xlsx"], key="inv_omada")
@@ -2161,6 +2340,20 @@ with t2:
                 f"✓ Escola ativa/inativa: coluna **{_col_at_zy}**" if _col_at_zy
                 else "⚠️ Nenhuma coluna de ativa/inativa identificada neste export"
             )
+    with col_inv_ea:
+        st.caption("🟠 **EACE** — export de controle de OS (chamados)")
+        inv_eace = st.file_uploader("Export EACE (.xlsx)", type=["xlsx"], key="inv_eace")
+        if inv_eace:
+            try:
+                _chamados_prev, _linhas_prev = carregar_chamados_eace(inv_eace.getvalue())
+                st.caption(f"{_linhas_prev:,} chamado(s) no arquivo")
+                st.caption(
+                    f"✓ {len(_chamados_prev):,} escola(s) com chamado ativo"
+                    if _chamados_prev
+                    else "⚠️ Nenhum chamado ativo identificado (confira as colunas INEP e Status)"
+                )
+            except Exception as e:
+                st.caption(f"⚠️ Não foi possível ler o export: {e}")
 
     st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
 
@@ -2216,6 +2409,20 @@ with t2:
                     except Exception as e:
                         log_inv.append(("err", f"Zyxel: {e}"))
 
+                # ── EACE — chamados ativos ──
+                chamados_eace = {}
+                if inv_eace:
+                    try:
+                        chamados_eace, _ = carregar_chamados_eace(inv_eace.getvalue())
+                        if chamados_eace:
+                            total_os = sum(c.get("_qtd", 0) for c in chamados_eace.values())
+                            log_inv.append(("ok", f"EACE: {len(chamados_eace)} escola(s) com "
+                                                  f"chamado ativo ({total_os} OS)"))
+                        else:
+                            log_inv.append(("err", "EACE: nenhum chamado ativo identificado no export"))
+                    except Exception as e:
+                        log_inv.append(("err", f"EACE: {e}"))
+
                 if todas_linhas:
                     # DataFrame com todas as linhas coletadas (antes da deduplicação)
                     df_full = pd.DataFrame(todas_linhas)
@@ -2238,9 +2445,21 @@ with t2:
                     if removidos > 0:
                         log_inv.append(("ok", f"Deduplicação: {removidos} duplicata(s) removida(s)"))
 
+                    # Chamados do EACE anexados ao inventário já deduplicado
+                    if chamados_eace:
+                        df_inv = aplicar_chamados_eace(df_inv, chamados_eace)
+                        com_chamado = int((df_inv[EACE_TICKET_COLUMN] == "Sim").sum())
+                        sem_match   = len(chamados_eace) - com_chamado
+                        log_inv.append(("ok", f"Chamados EACE aplicados: {com_chamado} escola(s) "
+                                              f"do inventário com chamado ativo"))
+                        if sem_match > 0:
+                            log_inv.append(("err", f"EACE: {sem_match} INEP(s) com chamado ativo "
+                                                   f"não encontrado(s) em nenhum dashboard"))
+
                     # Garante ordem das colunas
                     col_order = ["INEP","Nome no Console","Status Rede","Status Agregado","Plataforma",
-                                 LAST_SEEN_COLUMN,ACTIVE_COLUMN,"Uptime WAN","ISP","Conta","IP Externo"]
+                                 LAST_SEEN_COLUMN,ACTIVE_COLUMN,*EACE_COLUMNS,
+                                 "Uptime WAN","ISP","Conta","IP Externo"]
                     for _c in (LAST_SEEN_COLUMN, ACTIVE_COLUMN):
                         if _c in df_inv.columns:
                             df_inv[_c] = df_inv[_c].fillna("—").replace("", "—")
@@ -2278,6 +2497,15 @@ with t2:
         n_om_inv    = df_inv["Status Rede"].str.contains("OMADA",    na=False).sum()
         n_zy_inv    = df_inv["Status Rede"].str.contains("ZYXEL",    na=False).sum()
 
+        if EACE_TICKET_COLUMN in df_inv.columns:
+            n_os_inv  = int((df_inv[EACE_TICKET_COLUMN] == "Sim").sum())
+            card_eace = f"""
+          <div class="saas-card"><div class="saas-card-label">Com chamado ativo</div>
+            <div class="saas-card-value c-red">{n_os_inv:,}</div>
+            <div class="saas-card-sub">{f"{n_os_inv/total_inv*100:.0f}% · EACE" if total_inv else "EACE"}</div></div>"""
+        else:
+            card_eace = ""
+
         st.markdown(f"""
         <div class="saas-grid">
           <div class="saas-card"><div class="saas-card-label">Total escolas</div>
@@ -2293,7 +2521,7 @@ with t2:
           <div class="saas-card"><div class="saas-card-label">Omada</div>
             <div class="saas-card-value c-teal">{n_om_inv:,}</div><div class="saas-card-sub">controllers</div></div>
           <div class="saas-card"><div class="saas-card-label">Zyxel</div>
-            <div class="saas-card-value c-purple">{n_zy_inv:,}</div><div class="saas-card-sub">sites</div></div>
+            <div class="saas-card-value c-purple">{n_zy_inv:,}</div><div class="saas-card-sub">sites</div></div>{card_eace}
         </div>""", unsafe_allow_html=True)
 
         # Pesquisa e filtros
@@ -2313,6 +2541,14 @@ with t2:
             fs_inv  = f2_inv.multiselect("Status",     op_st_inv,   default=[], key="fs_inv")
             fi_inv  = f3_inv.multiselect("ISP",        op_isp_inv,  default=[], key="fi_inv")
 
+            fo_inv = "Todas"
+            if EACE_TICKET_COLUMN in df_inv.columns:
+                fo_inv = st.radio(
+                    "Chamado ativo (EACE)",
+                    ["Todas", "Somente com chamado", "Somente sem chamado"],
+                    horizontal=True, key="fo_inv",
+                )
+
         df_inv_f = df_inv.copy()
 
         # Pesquisa textual em INEP e Nome
@@ -2326,6 +2562,10 @@ with t2:
         if fp_inv: df_inv_f = df_inv_f[df_inv_f["Plataforma"].isin(fp_inv)]
         if fs_inv: df_inv_f = df_inv_f[df_inv_f["Status Rede"].isin(fs_inv)]
         if fi_inv: df_inv_f = df_inv_f[df_inv_f["ISP"].isin(fi_inv)]
+        if fo_inv == "Somente com chamado":
+            df_inv_f = df_inv_f[df_inv_f[EACE_TICKET_COLUMN] == "Sim"]
+        elif fo_inv == "Somente sem chamado":
+            df_inv_f = df_inv_f[df_inv_f[EACE_TICKET_COLUMN] != "Sim"]
 
         st.dataframe(
             df_inv_f.style.map(cor_status, subset=["Status Rede"]),
@@ -2349,7 +2589,8 @@ with t2:
             xlsx_inv,
             f"inventario_{datetime.now().strftime('%Y-%m-%d')}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            help="Planilha formatada: ESTATISTICAS, Geral, Escolas não encontradas, por conta."
+            help="Planilha formatada: ESTATISTICAS, Geral, Escolas não encontradas, "
+                 "Chamados Ativos EACE (quando o export for enviado) e uma aba por conta."
         )
         ce2.download_button(
             "⬇️ Exportar visualização atual",
@@ -2675,6 +2916,7 @@ with t7:
 - Coleta TODAS as escolas de todas as plataformas, sem depender de chamados
 - Ubiquiti: buscado automaticamente via API (todas as contas ativas)
 - Omada e Zyxel: faça upload dos exports na aba Inventário
+- EACE (controle de OS): upload opcional que marca as escolas com chamado ativo e o nº da OS
 - Campo de pesquisa por INEP ou nome da escola
 - Exportação filtrada ou completa em .xlsx
 
