@@ -47,6 +47,23 @@ EACE_COLUMNS       = [EACE_TICKET_COLUMN, EACE_OS_COLUMN, EACE_STATUS_COLUMN,
 # INEPs que aparecem em mais de uma conta/plataforma na mesma coleta.
 DUP_WHERE_COLUMN   = "Duplicado em"
 DUP_KEPT_COLUMN    = "Mantido no inventário"
+# Medições do SIMET (API pública do NIC.br), opcionais no inventário.
+SIMET_URL = "https://api.simet.nic.br/school-measures/v1/getLast2MonthsMeasuresByINEP?inep={}"
+SIMET_STATUS_COLUMN = "SIMET"
+SIMET_LAST_COLUMN   = "Última Medição"
+SIMET_DAYS_COLUMN   = "Dias sem Medir"
+SIMET_DOWN_COLUMN   = "Download (Mbps)"
+SIMET_UP_COLUMN     = "Upload (Mbps)"
+SIMET_LAT_COLUMN    = "Latência (ms)"
+SIMET_ISP_COLUMN    = "Provedor SIMET"
+SIMET_COLUMNS = [SIMET_STATUS_COLUMN, SIMET_LAST_COLUMN, SIMET_DAYS_COLUMN,
+                 SIMET_DOWN_COLUMN, SIMET_UP_COLUMN, SIMET_LAT_COLUMN, SIMET_ISP_COLUMN]
+SIMET_ATIVO     = "Ativo"
+SIMET_PARADO    = "Parado"
+SIMET_ABANDONADO = "Parado há muito tempo"
+SIMET_SEM       = "Sem SIMET"
+SIMET_ERRO      = "Erro na consulta"
+SIMET_ORDEM     = [SIMET_ATIVO, SIMET_PARADO, SIMET_ABANDONADO, SIMET_SEM, SIMET_ERRO]
 MONTHS_EN         = {
     "JAN": 1,
     "FEB": 2,
@@ -1120,6 +1137,7 @@ for k, v in {
     "ultima_consulta":   None,
     "df_inventario":     None,
     "df_duplicatas":     None,
+    "simet_cache":       {},
     "inv_ultima_coleta": None,
     "daily_report_current": None,
     "daily_report_authenticated": False,
@@ -1784,6 +1802,140 @@ def aplicar_chamados_eace(df: pd.DataFrame, chamados: dict) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════
+# SIMET — API PÚBLICA DO NIC.br
+# ═══════════════════════════════════════════════════════════════
+def _simet_media(valores) -> float | None:
+    nums = [v for v in valores if isinstance(v, (int, float))]
+    return round(sum(nums) / len(nums), 1) if nums else None
+
+
+def _simet_resumir(medicoes: list) -> dict:
+    """Condensa as medições dos últimos 2 meses de uma escola."""
+    if not medicoes:
+        return {"n": 0}
+
+    por_dia = {}
+    for m in medicoes:
+        por_dia.setdefault(str(m.get("dia") or "")[:10], []).append(m)
+    dias = sorted(d for d in por_dia if d)
+
+    # Velocidade/latência: média dos últimos 7 dias COM medição
+    recentes = []
+    for dia in dias[-7:]:
+        recentes.extend(por_dia[dia])
+
+    ordenadas = sorted(medicoes, key=lambda m: str(m.get("horario_medicao") or ""),
+                       reverse=True)
+    provedor = next((m.get("nome_provedor") for m in ordenadas if m.get("nome_provedor")), None)
+
+    return {
+        "n":          len(medicoes),
+        "ultima":     max((str(m.get("horario_medicao") or "") for m in medicoes), default=""),
+        "ultimo_dia": dias[-1] if dias else None,
+        "down":       _simet_media([m.get("vel_download_mbps") for m in recentes]),
+        "up":         _simet_media([m.get("vel_upload_mbps")   for m in recentes]),
+        "lat":        _simet_media([m.get("latencia_ms")       for m in recentes]),
+        "provedor":   provedor,
+    }
+
+
+def consultar_simet(inep: str) -> tuple[str, dict]:
+    """Consulta um INEP na API do SIMET. Nunca levanta exceção."""
+    for tentativa in range(3):
+        try:
+            r = requests.get(SIMET_URL.format(inep), timeout=45,
+                             headers={"Accept": "application/json"})
+            if r.status_code == 404:
+                return inep, {"n": 0}
+            if r.status_code != 200:
+                raise Exception(f"HTTP {r.status_code}")
+            return inep, _simet_resumir(r.json())
+        except Exception as e:
+            if tentativa == 2:
+                return inep, {"erro": str(e)[:60]}
+            time.sleep(1.5 * (tentativa + 1))
+    return inep, {"erro": "falhou"}
+
+
+def coletar_simet(ineps, cache: dict, progresso=None) -> dict:
+    """
+    Consulta em paralelo os INEPs que ainda não estão no cache da sessão.
+    `progresso` recebe (feitos, total) a cada resposta.
+    """
+    pendentes = [i for i in ineps if i and i != "—" and i not in cache]
+    if not pendentes:
+        return cache
+
+    feitos = 0
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futuros = {ex.submit(consultar_simet, i): i for i in pendentes}
+        for fut in as_completed(futuros):
+            inep, dados = fut.result()
+            cache[inep] = dados
+            feitos += 1
+            if progresso and (feitos % 25 == 0 or feitos == len(pendentes)):
+                progresso(feitos, len(pendentes))
+    return cache
+
+
+def classificar_simet(dados: dict | None) -> str:
+    """Ativo / Parado / Parado há muito tempo / Sem SIMET / Erro."""
+    if not dados:
+        return SIMET_ERRO if dados is not None else "—"
+    if "erro" in dados:
+        return SIMET_ERRO
+    if not dados.get("n"):
+        return SIMET_SEM
+    try:
+        ultimo = datetime.strptime(str(dados.get("ultimo_dia"))[:10], "%Y-%m-%d").date()
+        dias   = (datetime.now(APP_TZ).date() - ultimo).days
+    except Exception:
+        return SIMET_ATIVO
+    if dias <= 3:
+        return SIMET_ATIVO
+    if dias <= 15:
+        return SIMET_PARADO
+    return SIMET_ABANDONADO
+
+
+def _simet_dias(dados: dict) -> int | str:
+    try:
+        ultimo = datetime.strptime(str(dados.get("ultimo_dia"))[:10], "%Y-%m-%d").date()
+        return (datetime.now(APP_TZ).date() - ultimo).days
+    except Exception:
+        return "—"
+
+
+def aplicar_simet(df: pd.DataFrame, cache: dict) -> pd.DataFrame:
+    """Acrescenta as colunas de medição do SIMET ao inventário."""
+    if df is None or df.empty:
+        return df
+
+    df = df.copy()
+    valores = {c: [] for c in SIMET_COLUMNS}
+    for inep in df["INEP"].astype(str).str.strip():
+        dados  = cache.get(inep)
+        status = classificar_simet(dados) if dados is not None else "—"
+        if not dados or status in (SIMET_SEM, SIMET_ERRO, "—"):
+            linha = [status, "—", "—", "—", "—", "—", "—"]
+        else:
+            ult = str(dados.get("ultima") or "")[:16]
+            if len(ult) >= 10:
+                ult = f"{ult[8:10]}/{ult[5:7]}/{ult[0:4]}{ult[10:16]}"
+            linha = [status, ult or "—", _simet_dias(dados),
+                     dados.get("down") if dados.get("down") is not None else "—",
+                     dados.get("up")   if dados.get("up")   is not None else "—",
+                     dados.get("lat")  if dados.get("lat")  is not None else "—",
+                     dados.get("provedor") or "—"]
+        for coluna, valor in zip(SIMET_COLUMNS, linha):
+            valores[coluna].append(valor)
+
+    for coluna in SIMET_COLUMNS:
+        df[coluna] = valores[coluna]
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════
 COR_STATUS = {
@@ -1917,7 +2069,8 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame,
             df[_c] = df[_c].fillna("—").replace("", "—")
 
     col_base = [c for c in ["INEP", "Nome no Console", "Status", LAST_SEEN_COLUMN,
-                            ACTIVE_COLUMN, *EACE_COLUMNS, "Conta", DUP_WHERE_COLUMN, "FASE"]
+                            ACTIVE_COLUMN, *EACE_COLUMNS, *SIMET_COLUMNS,
+                            "Conta", DUP_WHERE_COLUMN, "FASE"]
                 if c in df.columns]
     df = df[col_base].fillna("—").copy()
 
@@ -1965,6 +2118,8 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame,
             _ord=pd.to_numeric(df_chamados[EACE_DAYS_COLUMN], errors="coerce").fillna(-1)
         ).sort_values("_ord", ascending=False).drop(columns="_ord")
     n_com_chamado = int(df_chamados["INEP"].nunique()) if not df_chamados.empty else 0
+
+    tem_simet = SIMET_STATUS_COLUMN in df.columns and not validos.empty
 
     # INEPs repetidos na coleta (todas as ocorrências)
     df_duplicatas = df_dup.copy() if df_dup is not None and not df_dup.empty else pd.DataFrame()
@@ -2092,7 +2247,8 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame,
         CENTRAR = {"INEP", "Status", LAST_SEEN_COLUMN, ACTIVE_COLUMN,
                    "Conta", "FASE", "Ordem", EACE_TICKET_COLUMN, EACE_OS_COLUMN,
                    EACE_DAYS_COLUMN, EACE_OPENED_COLUMN,
-                   "Ocorrências", "Qtd Contas", "Tipo", DUP_KEPT_COLUMN}
+                   "Ocorrências", "Qtd Contas", "Tipo", DUP_KEPT_COLUMN,
+                   *[c for c in SIMET_COLUMNS if c != SIMET_ISP_COLUMN]}
         for ci, col_name in enumerate(cols, 1):
             _hdr(ws2, 2, ci, col_name, bg=NAVY)
         ws2.row_dimensions[2].height = 26
@@ -2123,6 +2279,91 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame,
         ws2.freeze_panes = "A3"
         ws2.auto_filter.ref = f"A2:{get_column_letter(nc)}2"
         _auto_width(ws2)
+
+    # ════════════════════════════════════════════════════════════
+    # ABA: SIMET (só quando a medição foi ativada na coleta)
+    # ════════════════════════════════════════════════════════════
+    if tem_simet:
+        wss = wb.create_sheet("SIMET")
+        wss.sheet_view.showGridLines = False
+        NCS = 4
+
+        _title(wss, 1, NCS, "MEDIÇÕES SIMET — NIC.br", bg=NAVY, size=16, height=44)
+        _cell(wss, 2, 1,
+              f"Consulta à API pública do SIMET em "
+              f"{datetime.now(APP_TZ).strftime('%d/%m/%Y às %H:%M')} — "
+              f"últimos 2 meses de medições, por INEP",
+              fg="595959", italic=True, align="center", border=False)
+        _merge_row(wss, 2, 1, NCS)
+        wss.row_dimensions[2].height = 18
+        wss.row_dimensions[3].height = 10
+
+        _title(wss, 4, NCS, "SITUAÇÃO DO SIMET POR ESCOLA", bg=BLUE, size=12, height=26)
+        for ci, h in enumerate(["SITUAÇÃO", "ESCOLAS", "% DO TOTAL"], 1):
+            _hdr(wss, 5, ci, h, bg=NAVY)
+        _merge_row(wss, 5, 3, NCS)
+        wss.row_dimensions[5].height = 22
+
+        cores_simet = {
+            SIMET_ATIVO:      (GRN_BG, GRN_FG),
+            SIMET_PARADO:     (ORG_BG, ORG_FG),
+            SIMET_ABANDONADO: (RED_BG, RED_FG),
+            SIMET_SEM:        (RED_BG, RED_FG),
+            SIMET_ERRO:       (GRAY,   "595959"),
+        }
+        contagem = validos[SIMET_STATUS_COLUMN].value_counts().to_dict()
+        total_s  = sum(contagem.values())
+        rs = 6
+        for situacao in SIMET_ORDEM:
+            if situacao not in contagem:
+                continue
+            bgs, fgs = cores_simet.get(situacao, (WHITE, "000000"))
+            _cell(wss, rs, 1, situacao, bg=bgs, fg=fgs, size=11, bold=True)
+            _cell(wss, rs, 2, int(contagem[situacao]), bg=bgs, fg=fgs, size=12,
+                  bold=True, align="center")
+            _cell(wss, rs, 3, f"{contagem[situacao]/total_s*100:.1f}%" if total_s else "—",
+                  bg=bgs, fg=fgs, size=11, align="center")
+            _merge_row(wss, rs, 3, NCS)
+            wss.row_dimensions[rs].height = 22
+            rs += 1
+        _cell(wss, rs, 1, "TOTAL DE ESCOLAS CONSULTADAS", bg=BLU_BG, size=11, bold=True)
+        _cell(wss, rs, 2, int(total_s), bg=BLU_BG, size=12, bold=True, align="center")
+        _cell(wss, rs, 3, "100%", bg=BLU_BG, size=11, align="center")
+        _merge_row(wss, rs, 3, NCS)
+        wss.row_dimensions[rs].height = 24
+        rs += 2
+
+        # Cruzamento rede x SIMET — onde está o diagnóstico de verdade
+        _title(wss, rs, NCS, "STATUS NA REDE  x  SIMET", bg=NAVY, size=12, height=28)
+        rs += 1
+        for ci, h in enumerate(["STATUS NA REDE", "SITUAÇÃO DO SIMET", "ESCOLAS", "LEITURA"], 1):
+            _hdr(wss, rs, ci, h, bg=BLUE)
+        wss.row_dimensions[rs].height = 22
+        rs += 1
+
+        leituras = {
+            ("Offline", SIMET_ATIVO):      "Link de pé — o problema é equipamento ou gestão",
+            ("Offline", SIMET_PARADO):     "Link caiu nos últimos dias",
+            ("Offline", SIMET_ABANDONADO): "Fora do ar há bastante tempo",
+            ("Offline", SIMET_SEM):        "Escola apagada e sem SIMET instalado",
+            ("Online",  SIMET_ATIVO):      "Tudo certo",
+            ("Online",  SIMET_PARADO):     "SIMET parou de medir — verificar o agente",
+            ("Online",  SIMET_ABANDONADO): "SIMET parado — verificar o agente",
+            ("Online",  SIMET_SEM):        "Instalar SIMET (abre OS)",
+        }
+        cruz = (validos.groupby(["Status", SIMET_STATUS_COLUMN]).size()
+                .sort_values(ascending=False))
+        for (rede, situacao), qtd in cruz.items():
+            bgs, fgs = cores_simet.get(situacao, (WHITE, "000000"))
+            _cell(wss, rs, 1, rede,     bg=bgs, fg=fgs, align="center")
+            _cell(wss, rs, 2, situacao, bg=bgs, fg=fgs, bold=True, align="center")
+            _cell(wss, rs, 3, int(qtd), bg=bgs, fg=fgs, bold=True, size=11, align="center")
+            _cell(wss, rs, 4, leituras.get((rede, situacao), "—"), bg=bgs, fg=fgs)
+            wss.row_dimensions[rs].height = 20
+            rs += 1
+
+        for letra, larg in zip(["A", "B", "C", "D"], [30, 26, 14, 52]):
+            wss.column_dimensions[letra].width = larg
 
     # ── Criar todas as abas ──────────────────────────────────────
     criar_aba("Geral", df,
@@ -2468,6 +2709,27 @@ with t2:
 
     st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
 
+    # ── Medição SIMET (opcional) ──
+    col_simet, col_simet_txt = st.columns([1, 3])
+    with col_simet:
+        medir_simet = st.toggle("📡 Medir SIMET", value=False, key="inv_simet",
+                                help="Consulta a API pública do SIMET (NIC.br) para cada "
+                                     "INEP do inventário.")
+    with col_simet_txt:
+        if medir_simet:
+            st.caption(
+                "✓ A planilha virá com as colunas **SIMET, Última Medição, Dias sem Medir, "
+                "Download, Upload, Latência e Provedor**, mais uma aba SIMET com o resumo e "
+                "o cruzamento rede × medição. A consulta leva cerca de **1 minuto a cada "
+                "400 escolas** e roda depois da coleta das plataformas."
+            )
+        else:
+            st.caption(
+                "Desativado — a coleta e a planilha saem como hoje, sem consultar o SIMET."
+            )
+
+    st.markdown('<hr class="saas-divider">', unsafe_allow_html=True)
+
     col_btn_inv, col_reset_inv, _ = st.columns([2, 2, 4])
     with col_btn_inv:
         if st.button("🔄 Coletar Inventário Completo", type="primary", use_container_width=True):
@@ -2580,9 +2842,45 @@ with t2:
                             log_inv.append(("err", f"EACE: {sem_match} INEP(s) com chamado ativo "
                                                    f"não encontrado(s) em nenhum dashboard"))
 
+                    # ── SIMET — só quando o botão está ligado ──
+                    if medir_simet:
+                        ineps_simet = sorted({
+                            str(i).strip() for i in df_inv["INEP"]
+                            if str(i).strip() not in ("—", "", "nan", "None")
+                        })
+                        cache_simet = st.session_state.simet_cache
+                        faltam = len([i for i in ineps_simet if i not in cache_simet])
+                        prog_simet = st.progress(
+                            0.0, text=f"Consultando SIMET — 0/{faltam} escolas..."
+                        )
+
+                        def _passo_simet(feitos, total):
+                            prog_simet.progress(
+                                feitos / total,
+                                text=f"Consultando SIMET — {feitos}/{total} escolas..."
+                            )
+
+                        t_simet = time.time()
+                        st.session_state.simet_cache = coletar_simet(
+                            ineps_simet, cache_simet, _passo_simet
+                        )
+                        prog_simet.progress(1.0, text="SIMET concluído.")
+                        df_inv = aplicar_simet(df_inv, st.session_state.simet_cache)
+
+                        resumo_simet = df_inv[df_inv["INEP"] != "—"] \
+                            .drop_duplicates(subset=["INEP"])[SIMET_STATUS_COLUMN] \
+                            .value_counts().to_dict()
+                        log_inv.append(("ok", f"SIMET: {len(ineps_simet)} escola(s) consultadas "
+                                              f"em {time.time()-t_simet:.0f}s — "
+                                              + ", ".join(f"{k}: {v}" for k, v in
+                                                          resumo_simet.items())))
+                        if resumo_simet.get(SIMET_ERRO):
+                            log_inv.append(("err", f"SIMET: {resumo_simet[SIMET_ERRO]} escola(s) "
+                                                   f"não responderam à API"))
+
                     # Garante ordem das colunas
                     col_order = ["INEP","Nome no Console","Status Rede","Status Agregado","Plataforma",
-                                 LAST_SEEN_COLUMN,ACTIVE_COLUMN,*EACE_COLUMNS,
+                                 LAST_SEEN_COLUMN,ACTIVE_COLUMN,*EACE_COLUMNS,*SIMET_COLUMNS,
                                  "Uptime WAN","ISP","Conta",DUP_WHERE_COLUMN,"IP Externo"]
                     for _c in (LAST_SEEN_COLUMN, ACTIVE_COLUMN):
                         if _c in df_inv.columns:
@@ -2647,6 +2945,18 @@ with t2:
             n_dup_inep = n_dup_contas = 0
             card_dup = ""
 
+        tem_simet_inv = SIMET_STATUS_COLUMN in df_inv.columns
+        if tem_simet_inv:
+            _unicos   = df_inv[df_inv["INEP"] != "—"].drop_duplicates(subset=["INEP"])
+            n_sem_sim = int((_unicos[SIMET_STATUS_COLUMN] == SIMET_SEM).sum())
+            n_ativ_sim = int((_unicos[SIMET_STATUS_COLUMN] == SIMET_ATIVO).sum())
+            card_simet = f"""
+          <div class="saas-card"><div class="saas-card-label">SIMET ativo</div>
+            <div class="saas-card-value c-green">{n_ativ_sim:,}</div>
+            <div class="saas-card-sub">{n_sem_sim:,} sem SIMET</div></div>"""
+        else:
+            card_simet = ""
+
         st.markdown(f"""
         <div class="saas-grid">
           <div class="saas-card"><div class="saas-card-label">Total de linhas</div>
@@ -2663,7 +2973,7 @@ with t2:
           <div class="saas-card"><div class="saas-card-label">Omada</div>
             <div class="saas-card-value c-teal">{n_om_inv:,}</div><div class="saas-card-sub">controllers</div></div>
           <div class="saas-card"><div class="saas-card-label">Zyxel</div>
-            <div class="saas-card-value c-purple">{n_zy_inv:,}</div><div class="saas-card-sub">sites</div></div>{card_eace}{card_dup}
+            <div class="saas-card-value c-purple">{n_zy_inv:,}</div><div class="saas-card-sub">sites</div></div>{card_eace}{card_dup}{card_simet}
         </div>""", unsafe_allow_html=True)
 
         # Pesquisa e filtros
@@ -2691,6 +3001,15 @@ with t2:
                     horizontal=True, key="fo_inv",
                 )
 
+            fsim_inv = []
+            if tem_simet_inv:
+                fsim_inv = st.multiselect(
+                    "Situação do SIMET",
+                    [s for s in SIMET_ORDEM
+                     if s in df_inv[SIMET_STATUS_COLUMN].unique()],
+                    default=[], key="fsim_inv",
+                )
+
         df_inv_f = df_inv.copy()
 
         # Pesquisa textual em INEP e Nome
@@ -2708,6 +3027,8 @@ with t2:
             df_inv_f = df_inv_f[df_inv_f[EACE_TICKET_COLUMN] == "Sim"]
         elif fo_inv == "Somente sem chamado":
             df_inv_f = df_inv_f[df_inv_f[EACE_TICKET_COLUMN] != "Sim"]
+        if fsim_inv:
+            df_inv_f = df_inv_f[df_inv_f[SIMET_STATUS_COLUMN].isin(fsim_inv)]
 
         st.dataframe(
             df_inv_f.style.map(cor_status, subset=["Status Rede"]),
@@ -2780,9 +3101,9 @@ with t2:
             xlsx_inv,
             f"inventario_{datetime.now().strftime('%Y-%m-%d')}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            help="Planilha formatada: ESTATISTICAS, Geral, Escolas não encontradas, "
-                 "Duplicatas, Chamados Ativos EACE (quando o export for enviado) "
-                 "e uma aba por conta."
+            help="Planilha formatada: ESTATISTICAS, SIMET (quando a medição estiver "
+                 "ligada), Geral, Escolas não encontradas, Duplicatas, Chamados Ativos "
+                 "EACE (quando o export for enviado) e uma aba por conta."
         )
         ce2.download_button(
             "⬇️ Exportar visualização atual",
@@ -3109,6 +3430,8 @@ with t7:
 - Ubiquiti: buscado automaticamente via API (todas as contas ativas)
 - Omada e Zyxel: faça upload dos exports na aba Inventário
 - EACE (controle de OS): upload opcional que marca as escolas com chamado ativo e o nº da OS
+- Botão "Medir SIMET": opcional, consulta a API pública do NIC.br e traz velocidade,
+  latência, provedor e há quantos dias cada escola não mede (desligado = coleta normal)
 - Campo de pesquisa por INEP ou nome da escola
 - O inventário mantém uma linha por INEP; todas as ocorrências repetidas ficam
   no painel "INEPs duplicados" e na aba Duplicatas da planilha
