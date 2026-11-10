@@ -28,6 +28,11 @@ from modules.monitoring import render_monitoring
 CONFIG_FILE       = "config_contas.json"
 CONFIG_PROVEDORES = "config_provedores.json"
 BASE_URL          = "https://api.ui.com/v1"
+UBIQUITI_EMPTY_HOSTS_MESSAGE = (
+    "A API respondeu HTTP 200, mas não retornou nenhum console para esta chave. "
+    "Confira no UniFi Site Manager se o usuário que gerou a chave tem acesso "
+    "às escolas esperadas e se a chave configurada pertence à conta correta."
+)
 APP_TZ            = ZoneInfo("America/Sao_Paulo")
 LAST_SEEN_COLUMN  = "Último Sinal"
 ACTIVE_COLUMN     = "Escola Ativa"
@@ -39,6 +44,9 @@ EACE_DAYS_COLUMN   = "Dias em Aberto"
 EACE_OPENED_COLUMN = "Chamado Aberto em"
 EACE_COLUMNS       = [EACE_TICKET_COLUMN, EACE_OS_COLUMN, EACE_STATUS_COLUMN,
                       EACE_DAYS_COLUMN, EACE_OPENED_COLUMN]
+# INEPs que aparecem em mais de uma conta/plataforma na mesma coleta.
+DUP_WHERE_COLUMN   = "Duplicado em"
+DUP_KEPT_COLUMN    = "Mantido no inventário"
 MONTHS_EN         = {
     "JAN": 1,
     "FEB": 2,
@@ -1111,6 +1119,7 @@ for k, v in {
     "relatorio":         [],
     "ultima_consulta":   None,
     "df_inventario":     None,
+    "df_duplicatas":     None,
     "inv_ultima_coleta": None,
     "daily_report_current": None,
     "daily_report_authenticated": False,
@@ -1244,6 +1253,9 @@ def coletar_todos_hosts_ubiquiti(contas: list) -> tuple:
             continue
         try:
             hosts = get_paginated_hosts(c["api_key"])
+            if not hosts:
+                erros.append(f"{c['apelido']}: {UBIQUITI_EMPTY_HOSTS_MESSAGE}")
+                continue
             for h in hosts:
                 d      = extrair_host(h)
                 inep   = extrair_inep_do_nome(d["nome"])
@@ -1287,7 +1299,10 @@ def testar_conta(api_key: str):
             headers={"X-API-KEY": api_key}, params={"pageSize": 1}, timeout=10
         )
         if r.status_code == 200:
-            return True, f"OK — {len(r.json().get('data', []))} host(s) retornado(s)"
+            hosts = r.json().get("data", [])
+            if not hosts:
+                return False, UBIQUITI_EMPTY_HOSTS_MESSAGE
+            return True, f"OK — {len(hosts)} host(s) retornado(s) nesta página de teste"
         return False, f"HTTP {r.status_code}"
     except requests.exceptions.Timeout:
         return False, "Timeout"
@@ -1804,7 +1819,8 @@ def _extrair_uf(nome: str) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
+def gerar_excel_inventario_formatado(df_inv: pd.DataFrame,
+                                     df_dup: pd.DataFrame | None = None) -> bytes:
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
@@ -1901,7 +1917,7 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
             df[_c] = df[_c].fillna("—").replace("", "—")
 
     col_base = [c for c in ["INEP", "Nome no Console", "Status", LAST_SEEN_COLUMN,
-                            ACTIVE_COLUMN, *EACE_COLUMNS, "Conta", "FASE"]
+                            ACTIVE_COLUMN, *EACE_COLUMNS, "Conta", DUP_WHERE_COLUMN, "FASE"]
                 if c in df.columns]
     df = df[col_base].fillna("—").copy()
 
@@ -1919,8 +1935,9 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
     nao_enc   = sorted(ineps_ref - ineps_enc)
     df_nao    = pd.DataFrame({"Ordem": range(1, len(nao_enc)+1), "INEP": nao_enc})
 
-    validos = df[df["INEP"] != "—"]
-    total   = len(validos)
+    validos      = df[df["INEP"] != "—"]
+    total        = len(validos)
+    ineps_unicos = int(validos["INEP"].nunique()) if not validos.empty else 0
     online  = int((validos["Status"] == "Online").sum())  if "Status" in validos.columns else 0
     offline = int((validos["Status"] == "Offline").sum()) if "Status" in validos.columns else 0
 
@@ -1947,6 +1964,14 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
         df_chamados = df_chamados.assign(
             _ord=pd.to_numeric(df_chamados[EACE_DAYS_COLUMN], errors="coerce").fillna(-1)
         ).sort_values("_ord", ascending=False).drop(columns="_ord")
+    n_com_chamado = int(df_chamados["INEP"].nunique()) if not df_chamados.empty else 0
+
+    # INEPs repetidos na coleta (todas as ocorrências)
+    df_duplicatas = df_dup.copy() if df_dup is not None and not df_dup.empty else pd.DataFrame()
+    tem_dup       = not df_duplicatas.empty
+    n_dup_inep    = int(df_duplicatas["INEP"].nunique()) if tem_dup else 0
+    n_dup_contas  = int(df_duplicatas[df_duplicatas["Tipo"] == "Entre contas"]["INEP"].nunique()) \
+        if tem_dup and "Tipo" in df_duplicatas.columns else 0
 
     contas_ordem = sorted(df["Conta"].dropna().unique().tolist()) \
         if "Conta" in df.columns else []
@@ -1987,13 +2012,13 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
 
     # Linhas 6–10 — KPIs
     kpis = [
-        ("Total de escolas no inventário",        total,   BLU_BG, "000000"),
+        ("Total de linhas no inventário",         total,        BLU_BG, "000000"),
+        ("INEPs distintos",                       ineps_unicos, BLU_BG, "000000"),
         ("Online",                                 online,  GRN_BG, GRN_FG),
         ("Offline",                                offline, RED_BG, RED_FG),
         ("Percentual online",
          f"{online/total*100:.2f}%" if total else "—",
          GRN_BG if (total and online/total >= .5) else RED_BG, "000000"),
-        ("Não encontradas em nenhum dashboard",   len(nao_enc), ORG_BG, ORG_FG),
     ]
     if ACTIVE_COLUMN in validos.columns:
         n_inativas = int((validos[ACTIVE_COLUMN] == "Inativa").sum())
@@ -2002,9 +2027,14 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
             kpis.append(("Escolas ativas (Omada/Zyxel)",   n_ativas,   GRN_BG, GRN_FG))
             kpis.append(("Escolas inativas (Omada/Zyxel)", n_inativas, ORG_BG, ORG_FG))
     if tem_eace:
-        kpis.append(("Escolas com chamado ativo (EACE)", len(df_chamados), RED_BG, RED_FG))
+        kpis.append(("Escolas com chamado ativo (EACE)", n_com_chamado, GRN_BG, GRN_FG))
         kpis.append(("Escolas sem chamado ativo (EACE)",
-                     int(total - len(df_chamados)), GRN_BG, GRN_FG))
+                     int(ineps_unicos - n_com_chamado), GRN_BG, GRN_FG))
+    if tem_dup:
+        kpis.append(("INEPs duplicados na coleta",  n_dup_inep,   ORG_BG, ORG_FG))
+        kpis.append(("INEPs em mais de uma conta",  n_dup_contas, ORG_BG, ORG_FG))
+        kpis.append(("Linhas repetidas por INEP duplicado",
+                     int(len(df_duplicatas) - n_dup_inep), ORG_BG, ORG_FG))
     for i, (label, val, bg, fg) in enumerate(kpis):
         r = 6 + i
         _cell(ws, r, 1, label, bg=bg, fg=fg, size=11)
@@ -2061,7 +2091,8 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
         # Linha 2 — cabeçalhos
         CENTRAR = {"INEP", "Status", LAST_SEEN_COLUMN, ACTIVE_COLUMN,
                    "Conta", "FASE", "Ordem", EACE_TICKET_COLUMN, EACE_OS_COLUMN,
-                   EACE_DAYS_COLUMN, EACE_OPENED_COLUMN}
+                   EACE_DAYS_COLUMN, EACE_OPENED_COLUMN,
+                   "Ocorrências", "Qtd Contas", "Tipo", DUP_KEPT_COLUMN}
         for ci, col_name in enumerate(cols, 1):
             _hdr(ws2, 2, ci, col_name, bg=NAVY)
         ws2.row_dimensions[2].height = 26
@@ -2095,11 +2126,18 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame) -> bytes:
 
     # ── Criar todas as abas ──────────────────────────────────────
     criar_aba("Geral", df,
-              "INVENTÁRIO GERAL — TODAS AS PLATAFORMAS")
+              f"INVENTÁRIO GERAL — TODAS AS PLATAFORMAS  "
+              f"({total} linhas · {ineps_unicos} INEPs distintos)")
 
     criar_aba("Escolas não encontradas dash´s", df_nao,
               f"ESCOLAS NÃO ENCONTRADAS EM NENHUM DASHBOARD  ({len(nao_enc)} INEPs)",
               bg_titulo=RED_HDR)
+
+    if tem_dup:
+        criar_aba("Duplicatas", df_duplicatas,
+                  f"INEPs DUPLICADOS NA COLETA  ({n_dup_inep} INEPs · "
+                  f"{n_dup_contas} em mais de uma conta)",
+                  bg_titulo=RED_HDR)
 
     if tem_eace:
         criar_aba("Chamados Ativos EACE", df_chamados,
@@ -2162,8 +2200,11 @@ def adicionar_candidatos_por_inep(destino: dict, origem: dict, ineps_filtrados: 
 
 def deduplicar_df_por_inep(df: pd.DataFrame) -> tuple:
     """
-    Versão DataFrame para o Inventário Geral.
+    Versão DataFrame, mantida como utilitário.
     Retorna (df_deduplicado, n_removidos).
+
+    O Inventário Geral NÃO usa mais esta função: ele entrega todas as linhas
+    coletadas e apenas destaca os INEPs repetidos (levantar_duplicatas_inep).
     """
     def _score_row(row):
         s = 0
@@ -2187,6 +2228,76 @@ def deduplicar_df_por_inep(df: pd.DataFrame) -> tuple:
     antes     = len(df)
     df_result = pd.concat([com_inep, sem_inep], ignore_index=True)
     return df_result, antes - len(df_result)
+
+
+def levantar_duplicatas_inep(df_full: pd.DataFrame, rids_mantidos: set | None = None) -> pd.DataFrame:
+    """
+    Todas as ocorrências dos INEPs que aparecem mais de uma vez na coleta,
+    levantadas ANTES da deduplicação — é o que mostra, por exemplo, uma
+    escola que está no Conta_PA3 e no admin0 ao mesmo tempo.
+    """
+    if df_full is None or df_full.empty or "INEP" not in df_full.columns:
+        return pd.DataFrame()
+
+    base = df_full[df_full["INEP"].astype(str) != "—"].copy()
+    dup  = base[base.duplicated(subset=["INEP"], keep=False)].copy()
+    if dup.empty:
+        return pd.DataFrame()
+
+    contas_por_inep = dup.groupby("INEP")["Conta"].apply(
+        lambda s: sorted(dict.fromkeys(s.astype(str)))
+    ) if "Conta" in dup.columns else pd.Series(dtype=object)
+    ocorrencias = dup["INEP"].value_counts()
+
+    dup["Ocorrências"] = dup["INEP"].map(ocorrencias)
+    dup["Qtd Contas"]  = dup["INEP"].map(lambda i: len(contas_por_inep.get(i, [])))
+    dup["Contas"]      = dup["INEP"].map(lambda i: " / ".join(contas_por_inep.get(i, [])) or "—")
+    dup["Tipo"]        = dup["Qtd Contas"].map(
+        lambda n: "Entre contas" if n > 1 else "Na mesma conta"
+    )
+    # Só faz sentido quando o chamador deduplicou e quer saber qual linha ficou.
+    if rids_mantidos is not None and "_rid" in dup.columns:
+        dup[DUP_KEPT_COLUMN] = dup["_rid"].map(
+            lambda r: "Sim" if r in rids_mantidos else "Não"
+        )
+
+    cols = [c for c in ["INEP", "Nome no Console", "Conta", "Plataforma", "Status Rede",
+                        LAST_SEEN_COLUMN, ACTIVE_COLUMN, "ISP", "IP Externo", "Uptime WAN",
+                        "Ocorrências", "Qtd Contas", "Contas", "Tipo", DUP_KEPT_COLUMN]
+            if c in dup.columns]
+    return (
+        dup.sort_values(["Qtd Contas", "Ocorrências", "INEP", "Conta"],
+                        ascending=[False, False, True, True])[cols]
+        .reset_index(drop=True)
+    )
+
+
+def marcar_duplicatas_no_inventario(df_inv: pd.DataFrame, df_dup: pd.DataFrame) -> pd.DataFrame:
+    """Marca, na linha que sobreviveu, em que outras contas o INEP também existe."""
+    if df_inv is None or df_inv.empty:
+        return df_inv
+
+    df_inv = df_inv.copy()
+    if df_dup is None or df_dup.empty or "Conta" not in df_dup.columns:
+        df_inv[DUP_WHERE_COLUMN] = "—"
+        return df_inv
+
+    contas_por_inep = df_dup.groupby("INEP")["Conta"].apply(
+        lambda s: list(dict.fromkeys(s.astype(str)))
+    ).to_dict()
+    ocorrencias = df_dup["INEP"].value_counts().to_dict()
+
+    def _outras(row):
+        inep = str(row.get("INEP", ""))
+        if inep not in contas_por_inep:
+            return "—"
+        outras = [c for c in contas_por_inep[inep] if c != str(row.get("Conta", ""))]
+        if outras:
+            return " / ".join(outras)
+        return f"Mesma conta ({ocorrencias.get(inep, 2)}x)"
+
+    df_inv[DUP_WHERE_COLUMN] = df_inv.apply(_outras, axis=1)
+    return df_inv
 
 
 def mesclar_isps_novos(isps_novos: set) -> int:
@@ -2382,7 +2493,8 @@ with t2:
                                 rows_c, erros_c = fut.result()
                                 todas_linhas.extend(rows_c)
                                 for e in erros_c: log_inv.append(("err", e))
-                                log_inv.append(("ok", f"Ubiquiti {ap}: {len(rows_c)} host(s)"))
+                                if rows_c:
+                                    log_inv.append(("ok", f"Ubiquiti {ap}: {len(rows_c)} host(s)"))
                             except Exception as e:
                                 log_inv.append(("err", f"Ubiquiti {ap}: {e}"))
                             done_inv += 1
@@ -2424,7 +2536,8 @@ with t2:
                         log_inv.append(("err", f"EACE: {e}"))
 
                 if todas_linhas:
-                    # DataFrame com todas as linhas coletadas (antes da deduplicação)
+                    # Inventário = TODAS as linhas coletadas, sem descartar nada:
+                    # ativas, inativas e INEPs repetidos entram do mesmo jeito.
                     df_full = pd.DataFrame(todas_linhas)
 
                     # Coluna agregada por INEP: considera ONLINE se alguma conta reportou ONLINE
@@ -2440,15 +2553,26 @@ with t2:
                     except Exception:
                         df_full["Status Agregado"] = ""
 
-                    # Deduplicação centralizada (mantém apenas uma linha por INEP)
-                    df_inv, removidos = deduplicar_df_por_inep(df_full)
-                    if removidos > 0:
-                        log_inv.append(("ok", f"Deduplicação: {removidos} duplicata(s) removida(s)"))
+                    # Nenhuma linha é descartada; os INEPs repetidos só são
+                    # levantados à parte para a aba/painel de duplicatas.
+                    df_inv = df_full.copy()
+                    df_dup = levantar_duplicatas_inep(df_full)
+                    df_inv = marcar_duplicatas_no_inventario(df_inv, df_dup)
+                    st.session_state.df_duplicatas = df_dup
 
-                    # Chamados do EACE anexados ao inventário já deduplicado
+                    if not df_dup.empty:
+                        n_ineps  = int(df_dup["INEP"].nunique())
+                        n_contas = int(df_dup[df_dup["Tipo"] == "Entre contas"]["INEP"].nunique())
+                        log_inv.append(("ok", f"Duplicatas: {n_ineps} INEP(s) repetidos em "
+                                              f"{len(df_dup)} linhas — {n_contas} aparecem em mais "
+                                              f"de uma conta (aba Duplicatas)"))
+
+                    # Chamados do EACE anexados a cada linha do inventário
                     if chamados_eace:
                         df_inv = aplicar_chamados_eace(df_inv, chamados_eace)
-                        com_chamado = int((df_inv[EACE_TICKET_COLUMN] == "Sim").sum())
+                        com_chamado = int(
+                            df_inv[df_inv[EACE_TICKET_COLUMN] == "Sim"]["INEP"].nunique()
+                        )
                         sem_match   = len(chamados_eace) - com_chamado
                         log_inv.append(("ok", f"Chamados EACE aplicados: {com_chamado} escola(s) "
                                               f"do inventário com chamado ativo"))
@@ -2459,7 +2583,7 @@ with t2:
                     # Garante ordem das colunas
                     col_order = ["INEP","Nome no Console","Status Rede","Status Agregado","Plataforma",
                                  LAST_SEEN_COLUMN,ACTIVE_COLUMN,*EACE_COLUMNS,
-                                 "Uptime WAN","ISP","Conta","IP Externo"]
+                                 "Uptime WAN","ISP","Conta",DUP_WHERE_COLUMN,"IP Externo"]
                     for _c in (LAST_SEEN_COLUMN, ACTIVE_COLUMN):
                         if _c in df_inv.columns:
                             df_inv[_c] = df_inv[_c].fillna("—").replace("", "—")
@@ -2467,20 +2591,24 @@ with t2:
                                     [c for c in df_inv.columns if c not in col_order]]
                     st.session_state.df_inventario     = df_inv
                     st.session_state.inv_ultima_coleta = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-                    st.success(f"Inventário coletado em {time.time()-t0:.1f}s — {len(df_inv):,} escola(s) únicas.")
-
-                    # Log
-                    html_log = "".join(
-                        f'<div class="log-{"ok" if tp=="ok" else "err"}">{"✓" if tp=="ok" else "✗"}  {m}</div>'
-                        for tp, m in log_inv
+                    st.success(
+                        f"Inventário coletado em {time.time()-t0:.1f}s — {len(df_inv):,} linha(s) "
+                        f"de todas as fontes · {df_inv['INEP'].nunique():,} INEP(s) distintos."
                     )
-                    st.markdown(f'<div class="log-box">{html_log}</div>', unsafe_allow_html=True)
                 else:
                     st.error("Nenhuma escola coletada. Verifique as fontes.")
+
+                # Exibe o motivo por conta mesmo quando nenhuma escola foi coletada.
+                html_log = "".join(
+                    f'<div class="log-{"ok" if tp=="ok" else "err"}">{"✓" if tp=="ok" else "✗"}  {html.escape(str(m))}</div>'
+                    for tp, m in log_inv
+                )
+                st.markdown(f'<div class="log-box">{html_log}</div>', unsafe_allow_html=True)
 
     with col_reset_inv:
         if st.button("🗑️ Limpar Inventário", use_container_width=True):
             st.session_state.df_inventario     = None
+            st.session_state.df_duplicatas     = None
             st.session_state.inv_ultima_coleta = None
             st.rerun()
 
@@ -2506,10 +2634,24 @@ with t2:
         else:
             card_eace = ""
 
+        df_dup_inv = st.session_state.df_duplicatas
+        tem_dup    = df_dup_inv is not None and not df_dup_inv.empty
+        if tem_dup:
+            n_dup_inep   = int(df_dup_inv["INEP"].nunique())
+            n_dup_contas = int(df_dup_inv[df_dup_inv["Tipo"] == "Entre contas"]["INEP"].nunique())
+            card_dup = f"""
+          <div class="saas-card"><div class="saas-card-label">INEPs duplicados</div>
+            <div class="saas-card-value c-yellow">{n_dup_inep:,}</div>
+            <div class="saas-card-sub">{n_dup_contas:,} em mais de uma conta</div></div>"""
+        else:
+            n_dup_inep = n_dup_contas = 0
+            card_dup = ""
+
         st.markdown(f"""
         <div class="saas-grid">
-          <div class="saas-card"><div class="saas-card-label">Total escolas</div>
-            <div class="saas-card-value c-blue">{total_inv:,}</div><div class="saas-card-sub">todas as plataformas</div></div>
+          <div class="saas-card"><div class="saas-card-label">Total de linhas</div>
+            <div class="saas-card-value c-blue">{total_inv:,}</div>
+            <div class="saas-card-sub">{df_inv["INEP"].nunique():,} INEPs distintos</div></div>
           <div class="saas-card"><div class="saas-card-label">Online</div>
             <div class="saas-card-value c-green">{online_inv:,}</div>
             <div class="saas-card-sub">{f"{online_inv/total_inv*100:.0f}%" if total_inv else "—"}</div></div>
@@ -2521,7 +2663,7 @@ with t2:
           <div class="saas-card"><div class="saas-card-label">Omada</div>
             <div class="saas-card-value c-teal">{n_om_inv:,}</div><div class="saas-card-sub">controllers</div></div>
           <div class="saas-card"><div class="saas-card-label">Zyxel</div>
-            <div class="saas-card-value c-purple">{n_zy_inv:,}</div><div class="saas-card-sub">sites</div></div>{card_eace}
+            <div class="saas-card-value c-purple">{n_zy_inv:,}</div><div class="saas-card-sub">sites</div></div>{card_eace}{card_dup}
         </div>""", unsafe_allow_html=True)
 
         # Pesquisa e filtros
@@ -2574,11 +2716,60 @@ with t2:
         )
         st.caption(f"{len(df_inv_f):,} de {len(df_inv):,} escolas exibidas")
 
+        # ── Duplicatas: todas as ocorrências, inclusive as descartadas ──
+        if tem_dup:
+            with st.expander(
+                f"⚠️ INEPs duplicados — {n_dup_inep:,} INEP(s), "
+                f"{len(df_dup_inv):,} ocorrência(s) · {n_dup_contas:,} em mais de uma conta",
+                expanded=False,
+            ):
+                st.caption(
+                    "O inventário traz **todas** as linhas coletadas, sem descartar nada. "
+                    "Aqui ficam só os INEPs que apareceram mais de uma vez — a coluna "
+                    "*Contas* mostra onde cada um está."
+                )
+                dup_c1, dup_c2 = st.columns([2, 2])
+                so_entre_contas = dup_c1.checkbox(
+                    "Somente INEPs em mais de uma conta", value=True, key="dup_entre_contas"
+                )
+                pesq_dup = dup_c2.text_input(
+                    "🔎 Pesquisar INEP, escola ou conta", key="dup_pesq", placeholder="Ex: 23000066 ou PA3"
+                )
+
+                df_dup_f = df_dup_inv.copy()
+                if so_entre_contas:
+                    df_dup_f = df_dup_f[df_dup_f["Tipo"] == "Entre contas"]
+                if pesq_dup.strip():
+                    alvo_dup = [c for c in ["INEP", "Nome no Console", "Conta", "Contas"]
+                                if c in df_dup_f.columns]
+                    mask_dup = False
+                    for c in alvo_dup:
+                        mask_dup = (df_dup_f[c].astype(str)
+                                    .str.contains(pesq_dup.strip(), case=False, na=False)) | mask_dup
+                    df_dup_f = df_dup_f[mask_dup]
+
+                st.dataframe(
+                    df_dup_f.style.map(cor_status, subset=["Status Rede"])
+                    if "Status Rede" in df_dup_f.columns else df_dup_f,
+                    use_container_width=True,
+                    height=380,
+                )
+                st.caption(
+                    f"{df_dup_f['INEP'].nunique():,} INEP(s) · {len(df_dup_f):,} ocorrência(s) exibidas"
+                )
+                st.download_button(
+                    "⬇️ Exportar duplicatas",
+                    to_xlsx(df_dup_f),
+                    f"duplicatas_inventario_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    help="Todas as ocorrências duplicadas, do jeito que estão na tabela acima.",
+                )
+
         # A planilha formatada leva alguns segundos; sem o spinner a área dos
         # botões fica vazia enquanto o arquivo é montado.
         try:
             with st.spinner("Preparando a planilha formatada…"):
-                xlsx_inv = gerar_excel_inventario_formatado(df_inv)
+                xlsx_inv = gerar_excel_inventario_formatado(df_inv, df_dup_inv)
             erro_xlsx = None
         except Exception as e:
             xlsx_inv, erro_xlsx = to_xlsx(df_inv), e
@@ -2590,7 +2781,8 @@ with t2:
             f"inventario_{datetime.now().strftime('%Y-%m-%d')}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             help="Planilha formatada: ESTATISTICAS, Geral, Escolas não encontradas, "
-                 "Chamados Ativos EACE (quando o export for enviado) e uma aba por conta."
+                 "Duplicatas, Chamados Ativos EACE (quando o export for enviado) "
+                 "e uma aba por conta."
         )
         ce2.download_button(
             "⬇️ Exportar visualização atual",
@@ -2918,6 +3110,8 @@ with t7:
 - Omada e Zyxel: faça upload dos exports na aba Inventário
 - EACE (controle de OS): upload opcional que marca as escolas com chamado ativo e o nº da OS
 - Campo de pesquisa por INEP ou nome da escola
+- O inventário mantém uma linha por INEP; todas as ocorrências repetidas ficam
+  no painel "INEPs duplicados" e na aba Duplicatas da planilha
 - Exportação filtrada ou completa em .xlsx
 
 **Central de Monitoramento:**
