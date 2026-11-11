@@ -50,13 +50,14 @@ DUP_KEPT_COLUMN    = "Mantido no inventário"
 # Medições do SIMET (API pública do NIC.br), opcionais no inventário.
 SIMET_URL = "https://api.simet.nic.br/school-measures/v1/getLast2MonthsMeasuresByINEP?inep={}"
 SIMET_STATUS_COLUMN = "SIMET"
+SIMET_TYPE_COLUMN   = "type"
 SIMET_LAST_COLUMN   = "Última Medição"
 SIMET_DAYS_COLUMN   = "Dias sem Medir"
 SIMET_DOWN_COLUMN   = "Download (Mbps)"
 SIMET_UP_COLUMN     = "Upload (Mbps)"
 SIMET_LAT_COLUMN    = "Latência (ms)"
 SIMET_ISP_COLUMN    = "Provedor SIMET"
-SIMET_COLUMNS = [SIMET_STATUS_COLUMN, SIMET_LAST_COLUMN, SIMET_DAYS_COLUMN,
+SIMET_COLUMNS = [SIMET_STATUS_COLUMN, SIMET_TYPE_COLUMN, SIMET_LAST_COLUMN, SIMET_DAYS_COLUMN,
                  SIMET_DOWN_COLUMN, SIMET_UP_COLUMN, SIMET_LAT_COLUMN, SIMET_ISP_COLUMN]
 SIMET_ATIVO     = "Ativo"
 SIMET_PARADO    = "Parado"
@@ -1830,6 +1831,8 @@ def _simet_resumir(medicoes: list) -> dict:
 
     return {
         "n":          len(medicoes),
+        "type":       " / ".join(sorted({m["type"] for m in medicoes
+                                        if isinstance(m.get("type"), str) and m["type"].strip()})) or "—",
         "ultima":     max((str(m.get("horario_medicao") or "") for m in medicoes), default=""),
         "ultimo_dia": dias[-1] if dias else None,
         "down":       _simet_media([m.get("vel_download_mbps") for m in recentes]),
@@ -1862,7 +1865,9 @@ def coletar_simet(ineps, cache: dict, progresso=None) -> dict:
     Consulta em paralelo os INEPs que ainda não estão no cache da sessão.
     `progresso` recebe (feitos, total) a cada resposta.
     """
-    pendentes = [i for i in ineps if i and i != "—" and i not in cache]
+    pendentes = [i for i in ineps if i and i != "—" and (
+        i not in cache or (cache[i].get("n") and "type" not in cache[i])
+    )]
     if not pendentes:
         return cache
 
@@ -1917,12 +1922,12 @@ def aplicar_simet(df: pd.DataFrame, cache: dict) -> pd.DataFrame:
         dados  = cache.get(inep)
         status = classificar_simet(dados) if dados is not None else "—"
         if not dados or status in (SIMET_SEM, SIMET_ERRO, "—"):
-            linha = [status, "—", "—", "—", "—", "—", "—"]
+            linha = [status, "—", "—", "—", "—", "—", "—", "—"]
         else:
             ult = str(dados.get("ultima") or "")[:16]
             if len(ult) >= 10:
                 ult = f"{ult[8:10]}/{ult[5:7]}/{ult[0:4]}{ult[10:16]}"
-            linha = [status, ult or "—", _simet_dias(dados),
+            linha = [status, dados.get("type") or "—", ult or "—", _simet_dias(dados),
                      dados.get("down") if dados.get("down") is not None else "—",
                      dados.get("up")   if dados.get("up")   is not None else "—",
                      dados.get("lat")  if dados.get("lat")  is not None else "—",
@@ -2718,7 +2723,7 @@ with t2:
     with col_simet_txt:
         if medir_simet:
             st.caption(
-                "✓ A planilha virá com as colunas **SIMET, Última Medição, Dias sem Medir, "
+                "✓ A planilha virá com as colunas **SIMET, type, Última Medição, Dias sem Medir, "
                 "Download, Upload, Latência e Provedor**, mais uma aba SIMET com o resumo e "
                 "o cruzamento rede × medição. A consulta leva cerca de **1 minuto a cada "
                 "400 escolas** e roda depois da coleta das plataformas."
