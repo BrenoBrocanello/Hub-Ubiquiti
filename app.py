@@ -1055,20 +1055,12 @@ def processar_link_decisao_acesso() -> bool:
 
 
 def render_hub_login() -> None:
-    st.markdown(
-        """
-        <div style="max-width: 460px; margin: 7vh auto 22px auto; text-align: center;">
-            <p class="page-title" style="font-size: 34px; margin-bottom: 8px;">Hub Redes - EACE</p>
-            <p class="page-sub" style="margin: 0;">Acesso restrito ao hub geral</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown('<div style="height: 15vh;"></div>', unsafe_allow_html=True)
 
     _, login_col, _ = st.columns([1, 1.1, 1])
     with login_col:
         with st.form("hub_login_form"):
-            email = st.text_input("E-mail", placeholder="seu.email@gmail.com")
+            email = st.text_input("E-mail")
             senha = st.text_input("Senha", type="password")
             entrar = st.form_submit_button("Entrar", type="primary", use_container_width=True)
 
@@ -1079,8 +1071,6 @@ def render_hub_login() -> None:
                 st.rerun()
             else:
                 st.error("E-mail ou senha inválidos.")
-
-        st.caption("Acesso exclusivo. Novos cadastros estão desativados.")
 
 
 # ═══════════════════════════════════════════════════════════════
