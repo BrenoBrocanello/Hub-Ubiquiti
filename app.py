@@ -83,6 +83,8 @@ HUB_REGISTRATION_EMAIL = "breno.brocanello@gmail.com"
 HUB_ACCESS_REQUESTS_FILE = os.path.join("data", "solicitacoes_acesso.json")
 HUB_PASSWORD_HASH_ITERATIONS = 260_000
 HUB_ALLOWED_EMAILS = set()
+# Acesso exclusivo: somente estes e-mails conseguem entrar no hub.
+HUB_OWNER_EMAILS = {"breno.brocanello@gmail.com"}
 
 st.set_page_config(
     page_title="Hub Redes — EACE",
@@ -696,8 +698,14 @@ def carregar_emails_permitidos() -> set[str]:
     return emails
 
 
+def email_tem_acesso_exclusivo(email: str) -> bool:
+    return normalizar_email(email) in {normalizar_email(e) for e in HUB_OWNER_EMAILS}
+
+
 def credenciais_hub_validas(email: str, senha: str) -> bool:
     email_normalizado = normalizar_email(email)
+    if not email_tem_acesso_exclusivo(email_normalizado):
+        return False
     usuario = carregar_usuarios_aprovados().get(email_normalizado)
     if not usuario:
         return False
@@ -1059,50 +1067,20 @@ def render_hub_login() -> None:
 
     _, login_col, _ = st.columns([1, 1.1, 1])
     with login_col:
-        login_tab, register_tab = st.tabs(["Entrar", "Registre-se"])
+        with st.form("hub_login_form"):
+            email = st.text_input("E-mail", placeholder="seu.email@gmail.com")
+            senha = st.text_input("Senha", type="password")
+            entrar = st.form_submit_button("Entrar", type="primary", use_container_width=True)
 
-        with login_tab:
-            with st.form("hub_login_form"):
-                email = st.text_input("E-mail", placeholder="seu.email@gmail.com")
-                senha = st.text_input("Senha", type="password")
-                entrar = st.form_submit_button("Entrar", type="primary", use_container_width=True)
+        if entrar:
+            if credenciais_hub_validas(email, senha):
+                st.session_state.hub_authenticated = True
+                st.session_state.hub_user_email = normalizar_email(email)
+                st.rerun()
+            else:
+                st.error("E-mail ou senha inválidos.")
 
-            if entrar:
-                if credenciais_hub_validas(email, senha):
-                    st.session_state.hub_authenticated = True
-                    st.session_state.hub_user_email = normalizar_email(email)
-                    st.rerun()
-                else:
-                    st.error("E-mail ou senha inválidos.")
-
-        with register_tab:
-            with st.form("hub_register_form"):
-                nome = st.text_input("Nome completo")
-                email_registro = st.text_input("E-mail corporativo ou Gmail", key="hub_register_email")
-                senha_registro = st.text_input("Senha", type="password", key="hub_register_password")
-                confirmacao_senha = st.text_input(
-                    "Confirmar senha",
-                    type="password",
-                    key="hub_register_password_confirm",
-                )
-                motivo = st.text_area("Motivo do acesso", height=90)
-                registrar = st.form_submit_button("Enviar solicitação", type="primary", use_container_width=True)
-
-            if registrar:
-                ok, msg = criar_solicitacao_acesso(
-                    nome,
-                    email_registro,
-                    motivo,
-                    senha_registro,
-                    confirmacao_senha,
-                )
-                if ok:
-                    if "não foi enviado" in msg:
-                        st.warning(msg)
-                    else:
-                        st.success(msg)
-                else:
-                    st.error(msg)
+        st.caption("Acesso exclusivo. Novos cadastros estão desativados.")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1125,6 +1103,10 @@ if not st.session_state.hub_local_requests_migrated:
 
 if processar_link_decisao_acesso():
     st.stop()
+
+if st.session_state.hub_authenticated and not email_tem_acesso_exclusivo(st.session_state.hub_user_email):
+    st.session_state.hub_authenticated = False
+    st.session_state.hub_user_email = ""
 
 if not st.session_state.hub_authenticated:
     render_hub_login()
