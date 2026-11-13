@@ -36,6 +36,8 @@ UBIQUITI_EMPTY_HOSTS_MESSAGE = (
 APP_TZ            = ZoneInfo("America/Sao_Paulo")
 LAST_SEEN_COLUMN  = "Último Sinal"
 ACTIVE_COLUMN     = "Escola Ativa"
+# Nível do site Zyxel: % de dispositivos offline (100% = offline de fato).
+ZYXEL_OFFLINE_PCT_COLUMN = "% Offline Zyxel"
 # Colunas alimentadas pelo export de controle de OS do portal EACE.
 EACE_TICKET_COLUMN = "Chamado Ativo"
 EACE_OS_COLUMN     = "Nº OS"
@@ -1552,76 +1554,106 @@ ZYXEL_STATUS_MAP = {
     "NO DEVICES":          "SEM DISPOSITIVO",
 }
 
-def processar_export_zyxel(df_zyxel: pd.DataFrame) -> dict:
-    resultado = {}
-    col_map   = {}
+def _mapear_colunas_zyxel(df_zyxel: pd.DataFrame) -> dict:
+    col_map = {}
     for col in df_zyxel.columns:
         cu = str(col).strip().upper()
-        if cu in ("ESTADO", "STATUS"):               col_map["status"]      = col
-        elif cu in ("NOME", "NAME"):                  col_map["nome"]        = col
+        if cu in ("ESTADO", "STATUS"):                 col_map["status"]      = col
+        elif cu in ("NOME", "NAME"):                    col_map["nome"]        = col
         elif cu in ("DISPOSITIVOS OFFLINE", "OFFLINE DEVICES"): col_map["offline"] = col
-        elif cu in ("DISPOSITIVOS", "DEVICES"):       col_map["total_dev"]   = col
-        elif cu in ("% OFFLINE", "% OFFLINE DEVICES"):col_map["pct_offline"] = col
+        elif cu in ("DISPOSITIVOS", "DEVICES"):         col_map["total_dev"]   = col
+        elif cu in ("% OFFLINE", "% OFFLINE DEVICES"):  col_map["pct_offline"] = col
+    return col_map
+
+
+def _numero_zyxel(valor) -> float | None:
+    """Extrai o número de células como '75.0 %', '2' ou 'N/A'."""
+    match = re.search(r"\d+(?:[.,]\d+)?", str(valor))
+    if not match:
+        return None
+    try:
+        return float(match.group(0).replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _percentual_offline_zyxel(row, col_map) -> float | None:
+    """% de dispositivos offline do site; calcula pelas contagens se a coluna faltar."""
+    if "pct_offline" in col_map:
+        pct = _numero_zyxel(row.get(col_map["pct_offline"]))
+        if pct is not None:
+            return pct
+    total   = _numero_zyxel(row.get(col_map["total_dev"])) if "total_dev" in col_map else None
+    offline = _numero_zyxel(row.get(col_map["offline"]))   if "offline"   in col_map else None
+    if total and offline is not None:
+        return offline / total * 100
+    return None
+
+
+def formatar_percentual_offline(pct: float | None) -> str:
+    if pct is None:
+        return "—"
+    texto = f"{pct:.1f}".rstrip("0").rstrip(".").replace(".", ",")
+    return f"{texto}%"
+
+
+def _linha_zyxel(row, col_map, col_ativa) -> dict:
+    """
+    Converte uma linha do export Zyxel. O Nebula marca como 'Device offline'
+    qualquer site com ao menos um equipamento fora; só é offline de fato quando
+    100% dos dispositivos caíram. Abaixo disso o site fica 'ONLINE PARCIAL' e o
+    nível vai na coluna ZYXEL_OFFLINE_PCT_COLUMN.
+    """
+    status_raw     = str(row[col_map["status"]]).strip().upper()
+    status_interno = ZYXEL_STATUS_MAP.get(status_raw, "OFFLINE")
+    pct            = _percentual_offline_zyxel(row, col_map)
+    if status_interno == "OFFLINE" and pct is not None and 0 < pct < 100 \
+            and status_raw != "DEVICES UNREACHABLE":
+        status_interno = "ONLINE PARCIAL"
+    total_dev   = str(row.get(col_map.get("total_dev", ""), "—")).strip()
+    offline_dev = str(row.get(col_map.get("offline",   ""), "—")).strip()
+    return {
+        "Status Rede":             f"ZYXEL - {status_interno}",
+        "Plataforma":              "ZYXEL",
+        ZYXEL_OFFLINE_PCT_COLUMN:  formatar_percentual_offline(pct),
+        LAST_SEEN_COLUMN:          "—",
+        ACTIVE_COLUMN:             extrair_atividade(row, col_ativa),
+        "Uptime WAN":              "—",
+        "ISP":                     "—",
+        "Conta":                   "Zyxel Nebula",
+        "IP Externo":              "—",
+        "Devices (tot/off)":       f"{total_dev} / {offline_dev}",
+    }
+
+
+def processar_export_zyxel(df_zyxel: pd.DataFrame) -> dict:
+    resultado = {}
+    col_map   = _mapear_colunas_zyxel(df_zyxel)
     if "status" not in col_map or "nome" not in col_map:
         return resultado
     col_ativa = detectar_coluna_atividade(df_zyxel, ignorar=col_map.values())
     for _, row in df_zyxel.iterrows():
-        nome           = str(row[col_map["nome"]]).strip()
-        status_raw     = str(row[col_map["status"]]).strip().upper()
-        inep           = extrair_inep_do_nome(nome)
-        if not inep: continue
-        status_interno = ZYXEL_STATUS_MAP.get(status_raw, "OFFLINE")
-        total_dev      = str(row.get(col_map.get("total_dev",  ""), "—")).strip()
-        offline_dev    = str(row.get(col_map.get("offline",    ""), "—")).strip()
-        pct_offline    = str(row.get(col_map.get("pct_offline",""), "—")).strip()
-        resultado[inep] = {
-            "Status Rede":       f"ZYXEL - {status_interno}",
-            "Plataforma":        "ZYXEL",
-            LAST_SEEN_COLUMN:     "—",
-            ACTIVE_COLUMN:        extrair_atividade(row, col_ativa),
-            "Uptime WAN":        f"{pct_offline} offline" if pct_offline != "—" else "—",
-            "ISP":               "—",
-            "Conta":             "Zyxel Nebula",
-            "IP Externo":        "—",
-            "Nome no Console":   nome,
-            "Devices (tot/off)": f"{total_dev} / {offline_dev}",
-        }
+        nome = str(row[col_map["nome"]]).strip()
+        inep = extrair_inep_do_nome(nome)
+        if not inep:
+            continue
+        resultado[inep] = {**_linha_zyxel(row, col_map, col_ativa), "Nome no Console": nome}
     return resultado
 
 def processar_export_zyxel_completo(df_zyxel: pd.DataFrame) -> list:
     """Versão para inventário — retorna todas as linhas."""
     rows    = []
-    col_map = {}
-    for col in df_zyxel.columns:
-        cu = str(col).strip().upper()
-        if cu in ("ESTADO", "STATUS"):                col_map["status"]      = col
-        elif cu in ("NOME", "NAME"):                   col_map["nome"]        = col
-        elif cu in ("DISPOSITIVOS OFFLINE", "OFFLINE DEVICES"): col_map["offline"] = col
-        elif cu in ("DISPOSITIVOS", "DEVICES"):        col_map["total_dev"]   = col
-        elif cu in ("% OFFLINE", "% OFFLINE DEVICES"): col_map["pct_offline"] = col
+    col_map = _mapear_colunas_zyxel(df_zyxel)
     if "status" not in col_map or "nome" not in col_map:
         return rows
     col_ativa = detectar_coluna_atividade(df_zyxel, ignorar=col_map.values())
     for _, row in df_zyxel.iterrows():
-        nome           = str(row[col_map["nome"]]).strip()
-        status_raw     = str(row[col_map["status"]]).strip().upper()
-        inep           = extrair_inep_do_nome(nome)
-        status_interno = ZYXEL_STATUS_MAP.get(status_raw, "OFFLINE")
-        total_dev      = str(row.get(col_map.get("total_dev",  ""), "—")).strip()
-        offline_dev    = str(row.get(col_map.get("offline",    ""), "—")).strip()
-        pct_offline    = str(row.get(col_map.get("pct_offline",""), "—")).strip()
+        nome = str(row[col_map["nome"]]).strip()
+        inep = extrair_inep_do_nome(nome)
         rows.append({
-            "INEP":              inep or "—",
-            "Nome no Console":   nome,
-            "Status Rede":       f"ZYXEL - {status_interno}",
-            "Plataforma":        "ZYXEL",
-            LAST_SEEN_COLUMN:     "—",
-            ACTIVE_COLUMN:        extrair_atividade(row, col_ativa),
-            "Uptime WAN":        f"{pct_offline} offline" if pct_offline != "—" else "—",
-            "ISP":               "—",
-            "Conta":             "Zyxel Nebula",
-            "IP Externo":        "—",
-            "Devices (tot/off)": f"{total_dev} / {offline_dev}",
+            "INEP":            inep or "—",
+            "Nome no Console": nome,
+            **_linha_zyxel(row, col_map, col_ativa),
         })
     return rows
 
@@ -1922,7 +1954,8 @@ COR_STATUS = {
     "OMADA - OFFLINE":         "background:#2d1a0a; color:#fb923c; font-weight:600",
     "ZYXEL - ONLINE":          "background:#1a0a2e; color:#a855f7; font-weight:600",
     "ZYXEL - OFFLINE":         "background:#2d0a1f; color:#f472b6; font-weight:600",
-    "ZYXEL - ALERTA":          "background:#2d2200; color:#facc15; font-weight:600",
+    "ZYXEL - ONLINE PARCIAL":  "background:#2d1f0a; color:#fbbf24; font-weight:600",
+    "ZYXEL - ALERTA":         "background:#2d2200; color:#facc15; font-weight:600",
     "ZYXEL - SEM DISPOSITIVO": "background:#1a1f2e; color:#6b7280; font-weight:600",
     "NÃO ENCONTRADO":          "background:#1a1f2e; color:#374151; font-weight:600",
 }
@@ -2045,7 +2078,8 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame,
         if _c in df.columns:
             df[_c] = df[_c].fillna("—").replace("", "—")
 
-    col_base = [c for c in ["INEP", "Nome no Console", "Status", LAST_SEEN_COLUMN,
+    col_base = [c for c in ["INEP", "Nome no Console", "Status", ZYXEL_OFFLINE_PCT_COLUMN,
+                            LAST_SEEN_COLUMN,
                             ACTIVE_COLUMN, *EACE_COLUMNS, *SIMET_COLUMNS,
                             "Conta", DUP_WHERE_COLUMN, "FASE"]
                 if c in df.columns]
@@ -2221,7 +2255,7 @@ def gerar_excel_inventario_formatado(df_inv: pd.DataFrame,
             return
 
         # Linha 2 — cabeçalhos
-        CENTRAR = {"INEP", "Status", LAST_SEEN_COLUMN, ACTIVE_COLUMN,
+        CENTRAR = {"INEP", "Status", ZYXEL_OFFLINE_PCT_COLUMN, LAST_SEEN_COLUMN, ACTIVE_COLUMN,
                    "Conta", "FASE", "Ordem", EACE_TICKET_COLUMN, EACE_OS_COLUMN,
                    EACE_DAYS_COLUMN, EACE_OPENED_COLUMN,
                    "Ocorrências", "Qtd Contas", "Tipo", DUP_KEPT_COLUMN,
@@ -2388,7 +2422,8 @@ def deduplicar_por_inep(todos: dict) -> dict:
         if str(dados.get(LAST_SEEN_COLUMN, "—")) not in ("—", "", "nan"): s += 20
         if str(dados.get("ISP",        "—")) not in ("—", "", "nan"): s += 10
         if str(dados.get("IP Externo", "—")) not in ("—", "", "nan"): s += 5
-        if str(dados.get("Uptime WAN", "—")) not in ("—", "", "nan"): s += 1
+        if str(dados.get("Uptime WAN", "—")) not in ("—", "", "nan") \
+                or str(dados.get(ZYXEL_OFFLINE_PCT_COLUMN, "—")) not in ("—", "", "nan"): s += 1
         return s
 
     # Agrupa candidatos por INEP
@@ -2430,7 +2465,8 @@ def deduplicar_df_por_inep(df: pd.DataFrame) -> tuple:
         if str(row.get(LAST_SEEN_COLUMN, "—")) not in ("—", "", "nan"): s += 20
         if str(row.get("ISP",        "—")) not in ("—", "", "nan"): s += 10
         if str(row.get("IP Externo", "—")) not in ("—", "", "nan"): s += 5
-        if str(row.get("Uptime WAN", "—")) not in ("—", "", "nan"): s += 1
+        if str(row.get("Uptime WAN", "—")) not in ("—", "", "nan") \
+                or str(row.get(ZYXEL_OFFLINE_PCT_COLUMN, "—")) not in ("—", "", "nan"): s += 1
         return s
 
     sem_inep = df[df["INEP"] == "—"].copy()
@@ -2856,10 +2892,10 @@ with t2:
                                                    f"não responderam à API"))
 
                     # Garante ordem das colunas
-                    col_order = ["INEP","Nome no Console","Status Rede","Status Agregado","Plataforma",
-                                 LAST_SEEN_COLUMN,ACTIVE_COLUMN,*EACE_COLUMNS,*SIMET_COLUMNS,
+                    col_order = ["INEP","Nome no Console","Status Rede",ZYXEL_OFFLINE_PCT_COLUMN,
+                                 "Status Agregado","Plataforma",LAST_SEEN_COLUMN,ACTIVE_COLUMN,*EACE_COLUMNS,*SIMET_COLUMNS,
                                  "Uptime WAN","ISP","Conta",DUP_WHERE_COLUMN,"IP Externo"]
-                    for _c in (LAST_SEEN_COLUMN, ACTIVE_COLUMN):
+                    for _c in (LAST_SEEN_COLUMN, ACTIVE_COLUMN, ZYXEL_OFFLINE_PCT_COLUMN):
                         if _c in df_inv.columns:
                             df_inv[_c] = df_inv[_c].fillna("—").replace("", "—")
                     df_inv = df_inv[[c for c in col_order if c in df_inv.columns] +
@@ -3186,6 +3222,12 @@ with t3:
             if res_bm:
                 dfm = pd.DataFrame.from_dict(res_bm, orient="index").reset_index()
                 dfm.rename(columns={"index": "INEP"}, inplace=True)
+                if ZYXEL_OFFLINE_PCT_COLUMN in dfm.columns:
+                    dfm[ZYXEL_OFFLINE_PCT_COLUMN] = dfm[ZYXEL_OFFLINE_PCT_COLUMN].fillna("—")
+                    _cols_bm = list(dfm.columns)
+                    _cols_bm.remove(ZYXEL_OFFLINE_PCT_COLUMN)
+                    _cols_bm.insert(_cols_bm.index("Status Rede") + 1, ZYXEL_OFFLINE_PCT_COLUMN)
+                    dfm = dfm[_cols_bm]
                 col_c1, col_c2, col_c3, col_c4 = st.columns(4)
                 col_c1.metric("Encontrados",     len(dfm))
                 col_c2.metric("Online",  dfm["Status Rede"].str.contains("ONLINE",  na=False).sum())
@@ -3292,6 +3334,7 @@ with t4:
             "INEP",
             "Nome no Console",
             "Status Rede",
+            ZYXEL_OFFLINE_PCT_COLUMN,
             "Plataforma",
             LAST_SEEN_COLUMN,
             "Uptime WAN",
@@ -3431,5 +3474,7 @@ Zyxel Nebula → Overview → aba Sites → ícone de download (CSV) no canto su
 - 🟢 UBIQUITI - ONLINE / 🔴 UBIQUITI - OFFLINE
 - 🔵 OMADA - ONLINE / 🟠 OMADA - OFFLINE
 - 🟣 ZYXEL - ONLINE / 🩷 ZYXEL - OFFLINE / 🟡 ZYXEL - ALERTA
+- 🟠 ZYXEL - ONLINE PARCIAL: parte dos dispositivos offline (ex.: 33%, 75%).
+  Só conta como offline quando a coluna **% Offline Zyxel** é 100%.
 - ⬛ NÃO ENCONTRADO
     """)
